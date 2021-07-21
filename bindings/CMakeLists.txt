@@ -1,9 +1,11 @@
-if(NOT OPEN_FOR_IDE)
+if(NOT OPEN_FOR_IDE AND WITH_C)
   # flow bindings currently doesn't support that
   add_subdirectory(c)
   add_subdirectory(flow)
 endif()
-add_subdirectory(python)
+if(WITH_PYTHON)
+  add_subdirectory(python)
+endif()
 if(WITH_JAVA)
   add_subdirectory(java)
 endif()
