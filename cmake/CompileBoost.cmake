@@ -80,6 +80,8 @@ if(BOOST_ROOT)
   list(APPEND BOOST_HINT_PATHS ${BOOST_ROOT})
 endif()
 
+message(STATUS "BOOST paths ${BOOST_HINT_PATHS}")
+
 if(WIN32)
   # this should be done with the line below -- but apparently the CI is not set up
   # properly for config mode. So we use the old way on Windows
