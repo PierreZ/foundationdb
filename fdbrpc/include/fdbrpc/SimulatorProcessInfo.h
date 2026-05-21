@@ -22,6 +22,7 @@
 #define FDBRPC_SIMULATOR_PROCESSINFO_H
 
 #include <map>
+#include <memory>
 #include <string>
 
 #include "flow/NetworkAddress.h"
@@ -36,6 +37,10 @@
 #include "fdbrpc/SimulatorKillType.h"
 
 struct MachineInfo;
+
+// Forward-declare OpenSSL X509 so consumers don't need <openssl/x509.h>.
+struct x509_st;
+typedef struct x509_st X509;
 
 namespace simulator {
 
@@ -71,6 +76,14 @@ struct ProcessInfo : NonCopyable {
 
 	ProtocolVersion protocolVersion;
 	bool excludeFromRestarts = false;
+
+	// POC per-identity authz (src/design/key-range-authz.md): real X509 minted for this
+	// process by the simulator, with CN = locality["peer_cert_identity"]. Sim2Conn extracts
+	// the peer's CN from this cert using the same code path as production SSLConnection.
+	// Lazily populated on first access; regenerated when the locality CN changes (workloads
+	// switch identities between phases). shared_ptr deleter is X509_free.
+	std::shared_ptr<X509> peerCert;
+	std::string peerCertCN; // CN baked into peerCert; used to detect locality-driven changes.
 
 	std::vector<ProcessInfo*> childs;
 

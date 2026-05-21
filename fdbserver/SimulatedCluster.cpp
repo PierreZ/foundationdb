@@ -446,6 +446,10 @@ public:
 	int extraStorageMachineCountPerDC = 0;
 
 	Optional<bool> generateFearless, buggify, faultInjection;
+	// Pin SSL on/off instead of rolling sslEnabled (defaults to a 10% random roll). When set,
+	// the simulator forces both sslEnabled and sslOnly to this value. Useful for authz / TLS
+	// tests that need a deterministic TLS topology. See src/design/key-range-authz.md.
+	Optional<bool> forceSSL;
 	Optional<std::string> config;
 	Optional<std::string> remoteConfig;
 	bool randomlyRenameZoneId = false;
@@ -531,7 +535,8 @@ public:
 		    .add("longRunningTest", &longRunningTest)
 		    .add("simulationNormalRunTestsTimeoutSeconds", &simulationNormalRunTestsTimeoutSeconds)
 		    .add("simulationBuggifyRunTestsTimeoutSeconds", &simulationBuggifyRunTestsTimeoutSeconds)
-		    .add("statelessProcessClassesPerDC", &statelessProcessClassesPerDC);
+		    .add("statelessProcessClassesPerDC", &statelessProcessClassesPerDC)
+		    .add("forceSSL", &forceSSL);
 		try {
 			auto file = toml::parse(testFile);
 			if (file.contains("configuration") && toml::find(file, "configuration").is_table()) {
@@ -2253,9 +2258,13 @@ void setupSimulatedSystem(std::vector<Future<Void>>* systemActors,
 	// half the time, when we have more than 4 machines that are not the first in their dataCenter, assign classes
 	bool assignClasses = machineCount - dataCenters > 4 && deterministicRandom()->random01() < 0.5;
 
-	// Use SSL 5% of the time
-	bool sslEnabled = deterministicRandom()->random01() < 0.10;
-	bool sslOnly = sslEnabled && deterministicRandom()->coinflip();
+	// Use SSL 5% of the time (10% literally — comment predates the value). Tests can pin
+	// the outcome via the `forceSSL` configuration key in their toml — `forceSSL = true`
+	// makes every roll come out TLS-on, `forceSSL = false` always disables it.
+	bool sslEnabled = testConfig.forceSSL.present() ? testConfig.forceSSL.get()
+	                                                 : (deterministicRandom()->random01() < 0.10);
+	bool sslOnly = testConfig.forceSSL.present() ? testConfig.forceSSL.get()
+	                                              : (sslEnabled && deterministicRandom()->coinflip());
 	bool isTLS = sslEnabled && sslOnly;
 	g_simulator->listenersPerProcess = sslEnabled && !sslOnly ? 2 : 1;
 	CODE_PROBE(sslEnabled, "SSL enabled");

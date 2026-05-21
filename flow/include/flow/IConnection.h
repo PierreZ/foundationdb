@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <string>
 
 #include <boost/asio/ip/tcp.hpp>
 
@@ -81,6 +82,12 @@ public:
 	// For TLS-enabled connections, this is true if the peer has presented a valid chain of certificates trusted by the
 	// local endpoint. For non-TLS connections this is always true for any valid open connection.
 	virtual bool hasTrustedPeer() const = 0;
+
+	// Returns the verified peer identity for this connection, sourced from the mTLS handshake.
+	// Used by the per-identity key-range authorization layer (see src/design/key-range-authz.md).
+	// Returns an empty string when no identity is available (non-TLS connection, no client cert, etc.).
+	// Default returns empty; TLS-capable subclasses override to return the cert's CN (with SAN fallback).
+	virtual std::string getPeerCertIdentity() const { return {}; }
 
 	virtual UID getDebugID() const = 0;
 

@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "flow/MkCert.h"
+#include "flow/X509Identity.h"
 #include "fdbrpc/simulator.h"
 #include "flow/Arena.h"
 #ifndef BOOST_SYSTEM_NO_LIB
@@ -355,7 +356,39 @@ struct Sim2Conn final : IConnection, ReferenceCounted<Sim2Conn> {
 
 	bool isPeerGone() const { return !peer || peerProcess->failed; }
 
-	bool hasTrustedPeer() const override { return trustedPeer; }
+	// POC: a simulated peer that has assigned itself a "peer_cert_identity" locality is
+	// treated as an external (untrusted) client for the purposes of authz enforcement.
+	// Computed dynamically so the workload can toggle identities between phases without
+	// having to also recycle the underlying TCP-equivalent connection.
+	// See src/design/key-range-authz.md.
+	bool hasTrustedPeer() const override {
+		if (peerProcess && peerProcess->locality.get("peer_cert_identity"_sr).present()) {
+			return false;
+		}
+		return trustedPeer;
+	}
+
+	// POC per-identity authz: mint a real X509 for the peer with CN = locality["peer_cert_identity"]
+	// on first use, cache it on peerProcess, then run the SAME OpenSSL CN extractor the production
+	// SSLConnection uses (extractCommonNameFromX509). The "handshake" is still fake (sim has no real
+	// OpenSSL handshake), but the X509 parse, X509_NAME_get_text_by_NID, and subject-name handling
+	// are real and shared with production. See src/design/key-range-authz.md.
+	std::string getPeerCertIdentity() const override {
+		if (!peerProcess) {
+			return {};
+		}
+		auto cnLoc = peerProcess->locality.get("peer_cert_identity"_sr);
+		if (!cnLoc.present()) {
+			return {};
+		}
+		std::string wantCN = cnLoc.get().toString();
+		// Re-mint if the locality CN changed since the last mint (workload switched identities).
+		if (!peerProcess->peerCert || peerProcess->peerCertCN != wantCN) {
+			peerProcess->peerCert = mkcert::makeSelfSignedCertWithCN(StringRef(wantCN));
+			peerProcess->peerCertCN = wantCN;
+		}
+		return extractCommonNameFromX509(peerProcess->peerCert.get());
+	}
 
 	bool isStableConnection() const override { return stableConnection; }
 

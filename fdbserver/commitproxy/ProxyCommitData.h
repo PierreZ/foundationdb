@@ -23,6 +23,7 @@
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/RangeLock.h"
 #include "fdbrpc/Stats.h"
+#include "fdbserver/authz/AuthzPolicyCache.h"
 #include "fdbserver/core/AccumulativeChecksumUtil.h"
 #include "fdbserver/logsystem/ApplyMetadataMutation.h"
 #include "fdbserver/core/Knobs.h"
@@ -219,6 +220,7 @@ struct ProxyCommitData {
 	PublicRequestStream<CommitTransactionRequest> commit;
 	Database cx;
 	Reference<AsyncVar<ServerDBInfo> const> db;
+	Reference<authz::AuthzPolicyCache> authzPolicyCache;
 	EventMetricHandle<SingleKeyMutationDescriptor> singleKeyMutationEvent;
 	std::map<UID, Reference<StorageInfo>> storageCache;
 	std::unordered_map<UID, StorageServerInterface> tssMapping;

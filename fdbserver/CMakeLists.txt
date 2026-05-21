@@ -25,6 +25,7 @@ if(WITH_ROCKSDB)
 endif()
 
 add_subdirectory(core)
+add_subdirectory(authz)
 add_subdirectory(kvstore)
 add_subdirectory(logsystem)
 add_subdirectory(mocks3)
@@ -166,6 +167,7 @@ target_link_libraries(fdbserver PRIVATE
   fdbserver_mocks3
   "$<LINK_LIBRARY:WHOLE_ARCHIVE,fdbserver_workloads>"
   fdbserver_worker
+  fdbserver_authz
   fdbserver_backupworker
   fdbserver_clustercontroller
   fdbserver_commitproxy

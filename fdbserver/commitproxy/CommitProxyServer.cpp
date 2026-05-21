@@ -1338,6 +1338,33 @@ Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 			continue;
 		}
 
+		// Per-identity key-range authorization (POC; src/design/key-range-authz.md).
+		// Pre-pass: if any mutation in this txn is denied by policy, reject the whole txn.
+		// Pattern mirrors the transaction_too_old per-txn rejection (line ~835).
+		if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && pProxyCommitData->authzPolicyCache) {
+			CommitTransactionRequest& tr = trs[self->transactionNum];
+			bool rejectedByACL = false;
+			for (auto const& m : tr.transaction.mutations) {
+				bool ok;
+				if (m.type == MutationRef::ClearRange) {
+					ok = pProxyCommitData->authzPolicyCache->checkRange(
+					    tr.isTrustedPeer(), tr.peerIdentity(), m.param1, m.param2, authz::Perm::W);
+				} else {
+					ok = pProxyCommitData->authzPolicyCache->check(
+					    tr.isTrustedPeer(), tr.peerIdentity(), m.param1, authz::Perm::W);
+				}
+				if (!ok) {
+					rejectedByACL = true;
+					break;
+				}
+			}
+			if (rejectedByACL) {
+				tr.reply.sendError(permission_denied());
+				self->committed[self->transactionNum] = ConflictBatchStatus::TransactionConflict;
+				continue;
+			}
+		}
+
 		bool checkSample = trs[self->transactionNum].commitCostEstimation.present();
 		Optional<ClientTrCommitCostEstimation>* trCost = &trs[self->transactionNum].commitCostEstimation;
 		int mutationNum = 0;
@@ -3076,6 +3103,10 @@ public:
 			    SERVER_KNOBS->IDEMPOTENCY_IDS_CLEANER_POLLING_INTERVAL));
 		}
 		addActor.send(idempotencyIdsExpireServer.run());
+
+		// Per-identity key-range authorization policy cache (POC; see src/design/key-range-authz.md).
+		commitData.authzPolicyCache = makeReference<authz::AuthzPolicyCache>();
+		addActor.send(commitData.authzPolicyCache->run(commitData.cx));
 
 		// wait for txnStateStore recovery
 		co_await success(commitData.txnStateStore->readValue(StringRef()));

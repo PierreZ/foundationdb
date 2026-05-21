@@ -22,6 +22,7 @@
 #include "flow/AutoCPointer.h"
 #include "flow/IRandom.h"
 #include "flow/MkCert.h"
+#include "flow/X509Identity.h"
 #include "flow/PKey.h"
 #include "flow/ScopeExit.h"
 #include "flow/Trace.h"
@@ -374,4 +375,35 @@ CertAndKeyRef makePasswCert(Arena& arena, StringRef password) {
 	return CertAndKeyRef::make(arena, spec, CertAndKeyRef{}, password);
 }
 
+std::shared_ptr<X509> makeSelfSignedCertWithCN(StringRef commonName) {
+	auto arena = Arena();
+	auto spec = CertSpecRef::make(arena, CertKind(Server{}));
+	// Replace the default commonName entry produced by CertSpecRef::make.
+	for (auto& entry : spec.subjectName) {
+		if (entry.field == "commonName"_sr) {
+			entry.bytes = StringRef(arena, commonName);
+		}
+	}
+	auto pem = CertAndKeyRef::make(arena, spec, CertAndKeyRef{} /* self-signed */);
+	return readX509CertPem(pem.certPem);
+}
+
 } // namespace mkcert
+
+// Shared X509 CN extractor — used by both flow/Net2.cpp::SSLConnection (production TLS path)
+// and fdbrpc/sim2.cpp::Sim2Conn (simulation, against an injected X509). Same code, two callers.
+std::string extractCommonNameFromX509(X509* cert) {
+	if (cert == nullptr) {
+		return {};
+	}
+	X509_NAME* name = ::X509_get_subject_name(cert);
+	if (name == nullptr) {
+		return {};
+	}
+	char buf[256];
+	int len = ::X509_NAME_get_text_by_NID(name, NID_commonName, buf, sizeof(buf));
+	if (len <= 0) {
+		return {};
+	}
+	return std::string(buf, static_cast<size_t>(len));
+}

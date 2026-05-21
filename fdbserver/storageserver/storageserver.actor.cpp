@@ -38,6 +38,7 @@
 #include "fdbclient/FDBTypes.h"
 #include "fdbrpc/fdbrpc.h"
 #include "fdbrpc/LoadBalance.h"
+#include "fdbserver/authz/AuthzPolicyCache.h"
 #include "fdbserver/core/AccumulativeChecksumUtil.h"
 #include "fdbserver/core/BulkDumpUtil.h"
 #include "fdbserver/core/BulkLoadUtil.h"
@@ -1193,6 +1194,7 @@ public:
 	Reference<AsyncVar<ServerDBInfo> const> db;
 	Database cx;
 	ActorCollection actors;
+	Reference<authz::AuthzPolicyCache> authzPolicyCache;
 
 	CoalescedKeyRangeMap<bool, int64_t, KeyBytesMetric<int64_t>> byteSampleClears;
 	AsyncVar<bool> byteSampleClearsTooLarge;
@@ -1511,6 +1513,10 @@ public:
 		}
 
 		cx = openDBOnServer(db, TaskPriority::DefaultEndpoint, LockAware::True);
+		// Per-identity key-range authorization policy cache (POC; src/design/key-range-authz.md).
+		// The background refresh actor is started by the caller via actors.add() once SS is up
+		// (see the storageServer entrypoint where authzPolicyCache->run is launched).
+		authzPolicyCache = makeReference<authz::AuthzPolicyCache>();
 
 		this->storage.kvCommitLogicalBytes = &counters.kvCommitLogicalBytes;
 		this->storage.kvClearRanges = &counters.kvClearRanges;
@@ -2144,6 +2150,13 @@ Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 	Span span("SS:getValue"_loc, req.spanContext);
 	// Temporarily disabled -- this path is hit a lot
 	// getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.first();
+
+	// Per-identity key-range authorization check (POC; src/design/key-range-authz.md).
+	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && data->authzPolicyCache &&
+	    !data->authzPolicyCache->check(req.isTrustedPeer(), req.peerIdentity(), req.key, authz::Perm::R)) {
+		req.reply.sendError(permission_denied());
+		co_return;
+	}
 
 	try {
 		++data->counters.getValueQueries;
@@ -3314,6 +3327,19 @@ Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 {
 	Span span("SS:getKeyValues"_loc, req.spanContext);
 	int64_t resultSize = 0;
+
+	// Per-identity key-range authorization check (POC; src/design/key-range-authz.md).
+	// Single check covering the requested key range; mixed-permission denials surface a generic
+	// permission_denied so the boundary key is not revealed.
+	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && data->authzPolicyCache &&
+	    !data->authzPolicyCache->checkRange(req.isTrustedPeer(),
+	                                        req.peerIdentity(),
+	                                        req.begin.getKey(),
+	                                        req.end.getKey(),
+	                                        authz::Perm::R)) {
+		req.reply.sendError(permission_denied());
+		co_return;
+	}
 
 	getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.traceID;
 
@@ -5994,6 +6020,14 @@ Future<Void> getKeyValuesStreamQ(StorageServer* data, GetKeyValuesStreamRequest 
 Future<Void> getKeyQ(StorageServer* data, GetKeyRequest req) {
 	Span span("SS:getKey"_loc, req.spanContext);
 	int64_t resultSize = 0;
+
+	// Per-identity key-range authorization check (POC; src/design/key-range-authz.md).
+	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && data->authzPolicyCache &&
+	    !data->authzPolicyCache->check(
+	        req.isTrustedPeer(), req.peerIdentity(), req.sel.getKey(), authz::Perm::R)) {
+		req.reply.sendError(permission_denied());
+		co_return;
+	}
 
 	getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.traceID;
 
@@ -11917,6 +11951,7 @@ ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface
 
 	self->actors.add(updateStorage(self));
 	self->actors.add(waitFailureServer(ssi.waitFailure.getFuture()));
+	self->actors.add(self->authzPolicyCache->run(self->cx));
 	self->actors.add(self->otherError.getFuture());
 	self->actors.add(metricsCore(self, ssi));
 	self->actors.add(logLongByteSampleRecovery(self->byteSampleRecovery));

@@ -27,6 +27,15 @@
 
 class TimedRequest {
 	double _requestTime;
+	// Verified mTLS peer identity for this request, captured server-side at deserialization
+	// (the default constructor fires inside receiver->receive() while the thread-local is set).
+	// Empty on the client side. Used by the per-identity key-range authz check in CommitProxy / SS.
+	// See src/design/key-range-authz.md.
+	std::string _peerIdentity;
+	// Whether the connection delivering this request is a trusted (cluster-internal) peer.
+	// Captured at deserialization for the same reason as _peerIdentity — the originating
+	// thread-local is reset before the handler actor resumes.
+	bool _isTrustedPeer;
 
 public:
 	double requestTime() const {
@@ -36,9 +45,17 @@ public:
 
 	void setRequestTime(double requestTime) { _requestTime = requestTime; }
 
-	TimedRequest() {
+	std::string const& peerIdentity() const { return _peerIdentity; }
+	void setPeerIdentity(std::string identity) { _peerIdentity = std::move(identity); }
+
+	bool isTrustedPeer() const { return _isTrustedPeer; }
+	void setIsTrustedPeer(bool trusted) { _isTrustedPeer = trusted; }
+
+	TimedRequest() : _isTrustedPeer(false) {
 		if (!FlowTransport::isClient()) {
 			_requestTime = g_network->timer();
+			_peerIdentity = FlowTransport::transport().currentDeliveryPeerIdentity();
+			_isTrustedPeer = FlowTransport::transport().currentDeliveryPeerIsTrusted();
 		} else {
 			_requestTime = 0.0;
 		}
