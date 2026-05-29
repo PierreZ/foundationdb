@@ -1375,4 +1375,8 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	if (isSimulated) {
 		BULK_LOAD_USE_SST_INGEST = deterministicRandom()->coinflip();
 	}
+
+	// Per-identity key-range authorization (POC; see src/design/key-range-authz-v1.md)
+	init(AUTHZ_ENFORCEMENT_ENABLED, false);
+	init(AUTHZ_INITIAL_ADMIN_CN, "");
 }

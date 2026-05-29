@@ -1,0 +1,30 @@
+# POC end-to-end check for per-identity key-range authorization (v1).
+# See src/design/key-range-authz-v1.md.
+#
+# What this exercises:
+#   - Policy written to \xff/authz/policy/<identity>, recognized as a metadata mutation at the
+#     CommitProxy and broadcast (privatized) to every StorageServer, applied in version order.
+#   - CommitProxy + StorageServer enforcement gated by AUTHZ_ENFORCEMENT_ENABLED.
+#   - Cluster-internal traffic authenticates via the admin cert (AUTHZ_INITIAL_ADMIN_CN); a layer
+#     client presents a different identity and is enforced.
+#   - Real X509 cert (mkcert::makeSelfSignedCertWithCN) minted per simulated process; CN extracted
+#     via the same OpenSSL parser the production SSLConnection uses.
+
+[configuration]
+# Pin TLS on for every run. The simulator otherwise rolls sslEnabled at 10%, which would
+# make this test non-deterministic w.r.t. TLS topology.
+forceSSL = true
+
+[[knobs]]
+authz_enforcement_enabled = true
+authz_initial_admin_cn = "test-admin"
+
+[[test]]
+testTitle = "AuthzKeyRange"
+# Disable the auto-injected failure workloads (Attrition, RandomMoveKeys). They run concurrently on
+# the same tester process and commit system keys, which collides with this workload temporarily
+# switching its process identity to a non-admin CN to exercise enforcement. POC scope.
+runFailureWorkloads = false
+
+    [[test.workload]]
+    testName = "AuthzKeyRange"

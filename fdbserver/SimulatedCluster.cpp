@@ -446,6 +446,10 @@ public:
 	int extraStorageMachineCountPerDC = 0;
 
 	Optional<bool> generateFearless, buggify, faultInjection;
+	// Pin SSL on/off instead of rolling sslEnabled (defaults to a 10% random roll). When set,
+	// the simulator forces both sslEnabled and sslOnly to this value. Useful for authz / TLS
+	// tests that need a deterministic TLS topology. See src/design/key-range-authz-v1.md.
+	Optional<bool> forceSSL;
 	Optional<std::string> config;
 	Optional<std::string> remoteConfig;
 	bool randomlyRenameZoneId = false;
@@ -531,7 +535,8 @@ public:
 		    .add("longRunningTest", &longRunningTest)
 		    .add("simulationNormalRunTestsTimeoutSeconds", &simulationNormalRunTestsTimeoutSeconds)
 		    .add("simulationBuggifyRunTestsTimeoutSeconds", &simulationBuggifyRunTestsTimeoutSeconds)
-		    .add("statelessProcessClassesPerDC", &statelessProcessClassesPerDC);
+		    .add("statelessProcessClassesPerDC", &statelessProcessClassesPerDC)
+		    .add("forceSSL", &forceSSL);
 		try {
 			auto file = toml::parse(testFile);
 			if (file.contains("configuration") && toml::find(file, "configuration").is_table()) {
@@ -742,6 +747,15 @@ Future<ISimulator::KillType> simulatedFDBDRebooter(Reference<IClusterConnectionR
 		                                                           coordFolder->c_str(),
 		                                                           protocolVersion,
 		                                                           isDr);
+		// POC per-identity authz (src/design/key-range-authz-v1.md): every simulated process — cluster
+		// nodes, backup, AND testers/test infrastructure — defaults to the admin identity, so all
+		// cluster-internal and test-harness traffic (recovery, data distribution, ChangeConfig,
+		// consistency checks) passes the SS/proxy authz check. The authz workload temporarily overrides
+		// its own process identity (via the workload helper) to a non-admin CN to exercise enforcement.
+		// This is the simulation analog of deploying the admin cert to every cluster/ops process.
+		if (!SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN.empty()) {
+			process->simPeerIdentity = SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN;
+		}
 		co_await g_simulator->onProcess(
 		    process,
 		    TaskPriority::DefaultYield); // Now switch execution to the process on which we will run
@@ -786,6 +800,13 @@ Future<ISimulator::KillType> simulatedFDBDRebooter(Reference<IClusterConnectionR
 				bool client = processClass == ProcessClass::TesterClass || processMode == BackupAgentOnly ||
 				              processMode == SimHTTPServer;
 				FlowTransport::createInstance(client, 1, WLTOKEN_RESERVED_COUNT, &allowList);
+				// POC per-identity authz (src/design/key-range-authz-v1.md): loopback (sendLocal)
+				// delivery carries no cert, so a server reading its own hosted system keys would look
+				// unauthorized. Present this process's own identity (the admin CN for cluster nodes) on
+				// loopback so those self-reads pass enforcement.
+				if (process->simPeerIdentity.present()) {
+					FlowTransport::transport().setLocalIdentity(process->simPeerIdentity.get());
+				}
 				for (const auto& [keyName, key] : g_simulator->authKeys) {
 					FlowTransport::transport().addPublicKey(keyName, key.toPublic());
 				}
@@ -2266,9 +2287,13 @@ void setupSimulatedSystem(std::vector<Future<Void>>* systemActors,
 	// half the time, when we have more than 4 machines that are not the first in their dataCenter, assign classes
 	bool assignClasses = machineCount - dataCenters > 4 && deterministicRandom()->random01() < 0.5;
 
-	// Use SSL 5% of the time
-	bool sslEnabled = deterministicRandom()->random01() < 0.10;
-	bool sslOnly = sslEnabled && deterministicRandom()->coinflip();
+	// Use SSL 5% of the time (10% literally — comment predates the value). Tests can pin the outcome
+	// via the `forceSSL` configuration key in their toml — `forceSSL = true` makes every roll come
+	// out TLS-on, `forceSSL = false` always disables it. See src/design/key-range-authz-v1.md.
+	bool sslEnabled =
+	    testConfig.forceSSL.present() ? testConfig.forceSSL.get() : (deterministicRandom()->random01() < 0.10);
+	bool sslOnly =
+	    testConfig.forceSSL.present() ? testConfig.forceSSL.get() : (sslEnabled && deterministicRandom()->coinflip());
 	bool isTLS = sslEnabled && sslOnly;
 	g_simulator->listenersPerProcess = sslEnabled && !sslOnly ? 2 : 1;
 	CODE_PROBE(sslEnabled, "SSL enabled");

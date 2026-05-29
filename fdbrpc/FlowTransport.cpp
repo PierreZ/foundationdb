@@ -65,6 +65,11 @@ namespace {
 
 NetworkAddressList g_currentDeliveryPeerAddress = NetworkAddressList();
 bool g_currentDeliverPeerAddressTrusted = false;
+// Verified peer identity (mTLS cert CN) for the message currently being delivered.
+// Set alongside g_currentDeliverPeerAddressTrusted in deliver() before receiver->receive().
+// Read via FlowTransport::currentDeliveryPeerIdentity() from request handlers, BEFORE any co_await.
+// See src/design/key-range-authz-v1.md.
+std::string g_currentDeliveryPeerIdentity;
 Future<Void> g_currentDeliveryPeerDisconnect;
 
 } // namespace
@@ -361,6 +366,11 @@ public:
 	double lastIncompatibleMessage;
 	uint64_t transportId;
 	IPAllowList allowList;
+	// POC per-identity authz (src/design/key-range-authz-v1.md): the mTLS identity this process
+	// presents to itself on loopback (sendLocal) delivery. A server reading its own hosted system
+	// keys goes through loopback, which carries no cert; without this it would look like an empty
+	// (unauthorized) identity. Set once at process startup to the process's own CN.
+	std::string localIdentity;
 
 	Future<Void> multiVersionCleanup;
 	Future<Void> pingLogger;
@@ -1178,6 +1188,7 @@ static Future<Void> deliver(Uncancellable,
                             ArenaReader reader,
                             NetworkAddress peerAddress,
                             bool isTrustedPeer,
+                            std::string peerIdentity,
                             InReadSocket inReadSocket,
                             Future<Void> disconnect) {
 	// We want to run the task at the right priority. If the priority is higher than the current priority (which is
@@ -1199,8 +1210,10 @@ static Future<Void> deliver(Uncancellable,
 		try {
 			ASSERT(g_currentDeliveryPeerAddress == NetworkAddressList());
 			ASSERT(!g_currentDeliverPeerAddressTrusted);
+			ASSERT(g_currentDeliveryPeerIdentity.empty());
 			g_currentDeliveryPeerAddress = destination.addresses;
 			g_currentDeliverPeerAddressTrusted = isTrustedPeer;
+			g_currentDeliveryPeerIdentity = peerIdentity;
 			g_currentDeliveryPeerDisconnect = disconnect;
 			StringRef data = reader.arenaReadAll();
 			ASSERT(data.size() > 8);
@@ -1208,10 +1221,12 @@ static Future<Void> deliver(Uncancellable,
 			receiver->receive(objReader);
 			g_currentDeliveryPeerAddress = NetworkAddressList();
 			g_currentDeliverPeerAddressTrusted = false;
+			g_currentDeliveryPeerIdentity.clear();
 			g_currentDeliveryPeerDisconnect = Future<Void>();
 		} catch (Error& e) {
 			g_currentDeliveryPeerAddress = NetworkAddressList();
 			g_currentDeliverPeerAddressTrusted = false;
+			g_currentDeliveryPeerIdentity.clear();
 			g_currentDeliveryPeerDisconnect = Future<Void>();
 			TraceEvent(SevError, "ReceiverError")
 			    .error(e)
@@ -1262,6 +1277,7 @@ static void scanPackets(TransportData* transport,
                         Arena& arena,
                         NetworkAddress const& peerAddress,
                         bool isTrustedPeer,
+                        std::string const& peerIdentity,
                         ProtocolVersion peerProtocolVersion,
                         Future<Void> disconnect,
                         IsStableConnection isStableConnection) {
@@ -1399,6 +1415,7 @@ static void scanPackets(TransportData* transport,
 			        std::move(reader),
 			        peerAddress,
 			        isTrustedPeer,
+			        peerIdentity,
 			        InReadSocket::True,
 			        disconnect);
 		}
@@ -1446,6 +1463,7 @@ static Future<Void> connectionReader(TransportData* transport,
 	NetworkAddress peerAddress;
 	ProtocolVersion peerProtocolVersion;
 	bool trusted = transport->allowList(conn->getPeerAddress().ip) && conn->hasTrustedPeer();
+	std::string peerIdentity = conn->getPeerCertIdentity();
 	peerAddress = conn->getPeerAddress();
 
 	if (!peer) {
@@ -1613,6 +1631,7 @@ static Future<Void> connectionReader(TransportData* transport,
 						            arena,
 						            peerAddress,
 						            trusted,
+						            peerIdentity,
 						            peerProtocolVersion,
 						            peer->disconnect.getFuture(),
 						            IsStableConnection(g_network->isSimulated() && conn->isStableConnection()));
@@ -1967,6 +1986,7 @@ static void sendLocal(TransportData* self, ISerializeSource const& what, const E
 		        ArenaReader(copy.arena(), copy, AssumeVersion(currentProtocolVersion())),
 		        NetworkAddress(),
 		        true,
+		        self->localIdentity,
 		        InReadSocket::False,
 		        Never());
 	}
@@ -2200,6 +2220,18 @@ NetworkAddress FlowTransport::currentDeliveryPeerAddress() const {
 
 bool FlowTransport::currentDeliveryPeerIsTrusted() const {
 	return g_currentDeliverPeerAddressTrusted;
+}
+
+std::string FlowTransport::currentDeliveryPeerIdentity() const {
+	return g_currentDeliveryPeerIdentity;
+}
+
+void FlowTransport::setLocalIdentity(std::string identity) {
+	self->localIdentity = std::move(identity);
+}
+
+std::string FlowTransport::localIdentity() const {
+	return self->localIdentity;
 }
 
 void FlowTransport::addPublicKey(StringRef name, PublicKey key) {

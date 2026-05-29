@@ -81,8 +81,8 @@ public:
 	    uid_applyMutationsData(proxyMetadata_.uid_applyMutationsData), commit(proxyMetadata_.commit),
 	    cx(proxyMetadata_.cx), committedVersion(proxyMetadata_.committedVersion),
 	    storageCache(proxyMetadata_.storageCache), tag_popped(proxyMetadata_.tag_popped),
-	    tssMapping(proxyMetadata_.tssMapping), initialCommit(initialCommit_),
-	    provisionalCommitProxy(provisionalCommitProxy_),
+	    tssMapping(proxyMetadata_.tssMapping), authzPolicyMap(proxyMetadata_.authzPolicyMap),
+	    initialCommit(initialCommit_), provisionalCommitProxy(provisionalCommitProxy_),
 	    accumulativeChecksumIndex(getCommitProxyAccumulativeChecksumIndex(proxyMetadata_.commitProxyIndex)),
 	    acsBuilder(proxyMetadata_.acsBuilder), epoch(proxyMetadata_.epoch), rangeLock(proxyMetadata_.rangeLock) {
 
@@ -132,6 +132,8 @@ private:
 	std::map<UID, Reference<StorageInfo>>* storageCache = nullptr;
 	std::map<Tag, Version>* tag_popped = nullptr;
 	std::unordered_map<UID, StorageServerInterface>* tssMapping = nullptr;
+	// Per-identity key-range authz policy map on this proxy (POC; key-range-authz-v1.md).
+	std::map<std::string, authz::PolicyEntry>* authzPolicyMap = nullptr;
 
 	// true if the mutations were already written to the txnStateStore as part of recovery
 	bool initialCommit = false;
@@ -593,6 +595,81 @@ private:
 		}
 		toCommit->addTags(allTags);
 		writeMutation(privatized);
+	}
+
+	// Per-identity key-range authorization policy (POC; src/design/key-range-authz-v1.md).
+	// A set to \xff/authz/policy/<identity> updates this proxy's in-memory authz map and the
+	// txnStateStore, and is privatized + broadcast to ALL storage servers (modeled on
+	// checkSetGlobalKeys / the deleted tenant map) so every SS maintains the map in version order.
+	void checkSetAuthzPolicyPrefix(MutationRef m) {
+		if (!m.param1.startsWith(authzPolicyPrefix)) {
+			return;
+		}
+		// Update the proxy-local map (used for write-side enforcement). Done on both the normal and
+		// initialCommit (recovery replay) paths.
+		if (authzPolicyMap) {
+			std::string identity = m.param1.removePrefix(authzPolicyPrefix).toString();
+			(*authzPolicyMap)[identity] = authz::PolicyEntry::decode(m.param2);
+		}
+		if (!initialCommit) {
+			txnStateStore->set(KeyValueRef(m.param1, m.param2));
+		}
+		if (toCommit) {
+			auto allServers = txnStateStore->readRange(serverTagKeys).get();
+			std::set<Tag> allTags;
+			for (auto& kv : allServers) {
+				allTags.insert(decodeServerTagValue(kv.value));
+			}
+			MutationRef privatized = m;
+			privatized.clearChecksumAndAccumulativeIndex();
+			privatized.param1 = m.param1.withPrefix(systemKeys.begin, arena);
+			TraceEvent(SevDebug, "SendingPrivatized_AuthzPolicy", dbgid).detail("M", privatized);
+			if (acsBuilder != nullptr) {
+				updateMutationWithAcsAndAddMutationToAcsBuilder(
+				    acsBuilder, privatized, allTags, accumulativeChecksumIndex, epoch.get(), version, dbgid);
+			}
+			toCommit->addTags(allTags);
+			writeMutation(privatized);
+		}
+	}
+
+	// Revoke: a clear over \xff/authz/policy/* erases the affected identities from the proxy map and
+	// txnStateStore, and is privatized + broadcast to all storage servers.
+	void checkClearAuthzPolicyPrefix(KeyRangeRef range) {
+		if (!authzPolicyKeys.intersects(range)) {
+			return;
+		}
+		KeyRangeRef rangeToClear = range & authzPolicyKeys;
+		if (authzPolicyMap) {
+			for (auto it = authzPolicyMap->begin(); it != authzPolicyMap->end();) {
+				if (rangeToClear.contains(authzPolicyKeyFor(it->first))) {
+					it = authzPolicyMap->erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+		if (!initialCommit) {
+			txnStateStore->clear(rangeToClear);
+		}
+		if (toCommit) {
+			auto allServers = txnStateStore->readRange(serverTagKeys).get();
+			std::set<Tag> allTags;
+			for (auto& kv : allServers) {
+				allTags.insert(decodeServerTagValue(kv.value));
+			}
+			MutationRef privatized;
+			privatized.type = MutationRef::ClearRange;
+			privatized.param1 = rangeToClear.begin.withPrefix(systemKeys.begin, arena);
+			privatized.param2 = rangeToClear.end.withPrefix(systemKeys.begin, arena);
+			TraceEvent(SevDebug, "SendingPrivatized_ClearAuthzPolicy", dbgid).detail("M", privatized);
+			if (acsBuilder != nullptr) {
+				updateMutationWithAcsAndAddMutationToAcsBuilder(
+				    acsBuilder, privatized, allTags, accumulativeChecksumIndex, epoch.get(), version, dbgid);
+			}
+			toCommit->addTags(allTags);
+			writeMutation(privatized);
+		}
 	}
 
 	// Generates private mutations for the target storage server, instructing it to create a checkpoint.
@@ -1132,6 +1209,7 @@ public:
 				checkSetApplyMutationsKeyVersionMapRange(m);
 				checkSetLogRangesRange(m);
 				checkSetGlobalKeys(m);
+				checkSetAuthzPolicyPrefix(m);
 				checkSetWriteRecoverKey(m);
 				checkSetMinRequiredCommitVersionKey(m);
 				checkSetVersionEpochKey(m);
@@ -1149,6 +1227,7 @@ public:
 				checkClearApplyMutationsEndRange(m, range);
 				checkClearApplyMutationKeyVersionMapRange(m, range);
 				checkClearLogRangesRange(range);
+				checkClearAuthzPolicyPrefix(range);
 				checkClearTssMappingKeys(m, range);
 				checkClearTssQuarantineKeys(m, range);
 				checkClearVersionEpochKeys(m, range);

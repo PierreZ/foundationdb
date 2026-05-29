@@ -674,6 +674,16 @@ const KeyRef serverTagConflictPrefix = serverTagConflictKeys.begin;
 const KeyRangeRef serverTagHistoryKeys("\xff/serverTagHistory/"_sr, "\xff/serverTagHistory0"_sr);
 const KeyRef serverTagHistoryPrefix = serverTagHistoryKeys.begin;
 
+// Per-identity key-range authorization policy (POC; src/design/key-range-authz-v1.md).
+const KeyRangeRef authzPolicyKeys("\xff/authz/policy/"_sr, "\xff/authz/policy0"_sr);
+const KeyRef authzPolicyPrefix = authzPolicyKeys.begin;
+// Privatized/broadcast form: the public prefix shifted under \xff (systemKeys.begin), matching how
+// applyMetadataMutations privatizes a metadata mutation before tagging it to the StorageServers.
+const KeyRef authzPolicyPrivatePrefix = "\xff\xff/authz/policy/"_sr;
+Key authzPolicyKeyFor(StringRef identity) {
+	return identity.withPrefix(authzPolicyPrefix);
+}
+
 Key serverTagKeyFor(UID serverID) {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(serverTagKeys.begin);

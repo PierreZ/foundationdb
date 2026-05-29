@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "flow/MkCert.h"
+#include "flow/X509Identity.h"
 #include "fdbrpc/simulator.h"
 #include "flow/Arena.h"
 #ifndef BOOST_SYSTEM_NO_LIB
@@ -354,7 +355,30 @@ struct Sim2Conn final : IConnection, ReferenceCounted<Sim2Conn> {
 
 	bool isPeerGone() const { return !peer || peerProcess->failed; }
 
+	// NOTE (v1): hasTrustedPeer() is deliberately INDEPENDENT of the peer's authz identity.
+	// It governs only the FlowTransport private-endpoint dispatch gate. Coupling it to identity
+	// (as the v0 POC did) made every identity-bearing process trip that gate (unauthorized_attempt).
+	// Authz identity flows separately via getPeerCertIdentity(). See src/design/key-range-authz-v1.md.
 	bool hasTrustedPeer() const override { return trustedPeer; }
+
+	// POC per-identity authz: mint a real X509 for the peer with CN == peerProcess->simPeerIdentity
+	// on first use, cache it on peerProcess, then run the SAME OpenSSL CN extractor the production
+	// SSLConnection uses (extractCommonNameFromX509). The "handshake" is still fake (sim has no real
+	// OpenSSL handshake), but the X509 parse and subject-name handling are real and shared with
+	// production. Identity comes from the explicit simPeerIdentity field, NOT the placement locality.
+	// See src/design/key-range-authz-v1.md.
+	std::string getPeerCertIdentity() const override {
+		if (!peerProcess || !peerProcess->simPeerIdentity.present()) {
+			return {};
+		}
+		std::string wantCN = peerProcess->simPeerIdentity.get();
+		// Re-mint if the CN changed since the last mint (workload switched identities).
+		if (!peerProcess->peerCert || peerProcess->peerCertCN != wantCN) {
+			peerProcess->peerCert = mkcert::makeSelfSignedCertWithCN(StringRef(wantCN));
+			peerProcess->peerCertCN = wantCN;
+		}
+		return extractCommonNameFromX509(peerProcess->peerCert.get());
+	}
 
 	bool isStableConnection() const override { return stableConnection; }
 

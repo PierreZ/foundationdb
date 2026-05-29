@@ -42,6 +42,9 @@
 #endif
 #include <boost/asio.hpp>
 #include "boost/asio/ssl.hpp"
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include "flow/X509Identity.h"
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/range.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -1045,6 +1048,7 @@ public:
 				self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::server, std::move(p));
 			}
 			co_await onHandshook;
+			self->extractPeerIdentityFromCert();
 			co_await delay(0, TaskPriority::Handshake);
 			connected.send(Void());
 		} catch (...) {
@@ -1166,6 +1170,7 @@ public:
 				self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::client, std::move(p));
 			}
 			co_await onHandshook;
+			self->extractPeerIdentityFromCert();
 			co_await delay(0, TaskPriority::Handshake);
 			connected.send(Void());
 		} catch (...) {
@@ -1298,11 +1303,24 @@ public:
 
 	bool hasTrustedPeer() const override { return has_trusted_peer; }
 
+	std::string getPeerCertIdentity() const override { return peer_identity; }
+
 	UID getDebugID() const override { return id; }
 
 	tcp::socket& getSocket() override { return socket; }
 
 	ssl_socket& getSSLSocket() { return ssl_sock; }
+
+	// Extract the verified peer cert's CN into peer_identity. Called once after a successful handshake.
+	// Delegates to the free function extractCommonNameFromX509 (flow/X509Identity.h) so the same
+	// parser runs in production (here) and in simulation (Sim2Conn). See src/design/key-range-authz-v1.md.
+	void extractPeerIdentityFromCert() {
+		X509* cert = SSL_get_peer_certificate(ssl_sock.native_handle());
+		peer_identity = extractCommonNameFromX509(cert);
+		if (cert != nullptr) {
+			X509_free(cert);
+		}
+	}
 
 private:
 	UID id;
@@ -1311,6 +1329,7 @@ private:
 	NetworkAddress peer_address;
 	Reference<ReferencedObject<boost::asio::ssl::context>> sslContext;
 	bool has_trusted_peer;
+	std::string peer_identity; // CN from the verified peer cert; empty if no client cert presented
 	std::string sni_hostname; // For Server Name Indication
 
 	void init() {

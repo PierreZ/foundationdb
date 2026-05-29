@@ -28,6 +28,7 @@
 #include <set>
 #include <unordered_map>
 
+#include "fdbclient/AuthzPolicy.h"
 #include "fdbclient/BackupAgent.h"
 #include "fdbclient/MutationList.h"
 #include "fdbclient/Notified.h"
@@ -68,6 +69,10 @@ struct ApplyMetadataProxyContext {
 	std::map<UID, Reference<StorageInfo>>* storageCache = nullptr;
 	std::map<Tag, Version>* tag_popped = nullptr;
 	std::unordered_map<UID, StorageServerInterface>* tssMapping = nullptr;
+	// Per-identity key-range authz policy map maintained on this proxy (POC; key-range-authz-v1.md).
+	// Updated in version order from \xff/authz/policy/* metadata mutations; read for write-side
+	// enforcement in CommitProxyServer.
+	std::map<std::string, authz::PolicyEntry>* authzPolicyMap = nullptr;
 	uint16_t commitProxyIndex = 0;
 	std::shared_ptr<AccumulativeChecksumBuilder> acsBuilder = nullptr;
 	Optional<LogEpoch> epoch;

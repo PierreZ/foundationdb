@@ -1310,6 +1310,11 @@ public:
 
 	bool BULK_LOAD_USE_SST_INGEST; // Enable direct SST file ingestion for RocksDB storage engines
 
+	// Per-identity key-range authorization (POC; see src/design/key-range-authz-v1.md)
+	bool AUTHZ_ENFORCEMENT_ENABLED; // Master switch. When false, the data-plane check returns allow.
+	std::string AUTHZ_INITIAL_ADMIN_CN; // Admin identity (cert CN). Cluster/backup processes present this
+	                                    // CN; bootstraps the first policy write. Empty disables the admin bypass.
+
 	ServerKnobs(Randomize, ClientKnobs*, IsSimulated);
 	void initialize(Randomize, ClientKnobs*, IsSimulated);
 };

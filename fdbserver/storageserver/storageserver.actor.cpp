@@ -85,6 +85,7 @@
 #include "fdbclient/Notified.h"
 #include "fdbclient/StatusClient.h"
 #include "fdbclient/StorageServerShard.h"
+#include "fdbclient/AuthzPolicy.h"
 #include "fdbclient/SystemData.h"
 #include "fdbclient/TransactionLineage.h"
 #include "fdbclient/Tuple.h"
@@ -1185,6 +1186,10 @@ public:
 	// not be valid after a recovery.
 	Version initialClusterVersion = 1;
 	UID thisServerID;
+	// Per-identity key-range authz policy map (POC; src/design/key-range-authz-v1.md). Maintained in
+	// version order from privatized \xff\xff/authz/policy/* mutations applied in applyPrivateData;
+	// consulted by the read handlers (getValueQ/getKeyValuesQ/getKeyQ) for enforcement.
+	std::map<std::string, authz::PolicyEntry> authzPolicyMap;
 	Optional<UID> tssPairID; // if this server is a tss, this is the id of its (ss) pair
 	Optional<UID> ssPairID; // if this server is an ss, this is the id of its (tss) pair
 	Optional<double> tssFaultInjectTime;
@@ -2145,6 +2150,20 @@ Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 	Span span("SS:getValue"_loc, req.spanContext);
 	// Temporarily disabled -- this path is hit a lot
 	// getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.first();
+
+	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
+	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED &&
+	    !authz::checkAuthorized(
+	        data->authzPolicyMap, SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN, req.peerIdentity(), req.key, authz::Perm::R)) {
+		TraceEvent(SevWarnAlways, "AuthzSSDenyGetValue", data->thisServerID)
+		    .detail("Identity", req.peerIdentity())
+		    .detail("AdminCN", SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN)
+		    .detail("PolicyRows", data->authzPolicyMap.size())
+		    .detail("Client", req.reply.getEndpoint().getPrimaryAddress())
+		    .detail("Key", req.key);
+		req.reply.sendError(permission_denied());
+		co_return;
+	}
 
 	try {
 		++data->counters.getValueQueries;
@@ -3315,6 +3334,25 @@ Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 {
 	Span span("SS:getKeyValues"_loc, req.spanContext);
 	int64_t resultSize = 0;
+
+	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
+	// Single check covering the requested key range; mixed-permission denials surface a generic
+	// permission_denied so the boundary key is not revealed.
+	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && !authz::checkAuthorized(data->authzPolicyMap,
+	                                                                       SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN,
+	                                                                       req.peerIdentity(),
+	                                                                       req.begin.getKey(),
+	                                                                       req.end.getKey(),
+	                                                                       authz::Perm::R)) {
+		TraceEvent(SevWarnAlways, "AuthzSSDenyGetKeyValues", data->thisServerID)
+		    .detail("Identity", req.peerIdentity())
+		    .detail("AdminCN", SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN)
+		    .detail("PolicyRows", data->authzPolicyMap.size())
+		    .detail("Begin", req.begin.getKey())
+		    .detail("End", req.end.getKey());
+		req.reply.sendError(permission_denied());
+		co_return;
+	}
 
 	getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.traceID;
 
@@ -5995,6 +6033,21 @@ Future<Void> getKeyValuesStreamQ(StorageServer* data, GetKeyValuesStreamRequest 
 Future<Void> getKeyQ(StorageServer* data, GetKeyRequest req) {
 	Span span("SS:getKey"_loc, req.spanContext);
 	int64_t resultSize = 0;
+
+	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
+	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && !authz::checkAuthorized(data->authzPolicyMap,
+	                                                                       SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN,
+	                                                                       req.peerIdentity(),
+	                                                                       req.sel.getKey(),
+	                                                                       authz::Perm::R)) {
+		TraceEvent(SevWarnAlways, "AuthzSSDenyGetKey", data->thisServerID)
+		    .detail("Identity", req.peerIdentity())
+		    .detail("AdminCN", SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN)
+		    .detail("PolicyRows", data->authzPolicyMap.size())
+		    .detail("Key", req.sel.getKey());
+		req.reply.sendError(permission_denied());
+		co_return;
+	}
 
 	getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.traceID;
 
@@ -9497,6 +9550,27 @@ private:
 					    MutationRef(MutationRef::SetValue,
 					                encodePersistAccumulativeChecksumKey(stateToPersist.get().acsIndex),
 					                accumulativeChecksumValue(stateToPersist.get())));
+				}
+			}
+		} else if (m.param1.substr(1).startsWith(authzPolicyPrefix) &&
+		           (m.type == MutationRef::SetValue || m.type == MutationRef::ClearRange)) {
+			// Per-identity key-range authz policy, broadcast from the CommitProxy as a privatized
+			// metadata mutation (POC; src/design/key-range-authz-v1.md). Applied here in version
+			// order so every SS maintains the authority map without polling or a self-read.
+			if (m.type == MutationRef::SetValue) {
+				std::string identity = m.param1.substr(1).removePrefix(authzPolicyPrefix).toString();
+				data->authzPolicyMap[identity] = authz::PolicyEntry::decode(m.param2);
+			} else {
+				// Revoke: clear over the privatized [param1, param2) policy range.
+				KeyRef beginPub = m.param1.substr(1);
+				KeyRef endPub = m.param2.substr(1);
+				for (auto it = data->authzPolicyMap.begin(); it != data->authzPolicyMap.end();) {
+					Key fullKey = authzPolicyKeyFor(it->first);
+					if (beginPub <= fullKey && fullKey < endPub) {
+						it = data->authzPolicyMap.erase(it);
+					} else {
+						++it;
+					}
 				}
 			}
 		} else {

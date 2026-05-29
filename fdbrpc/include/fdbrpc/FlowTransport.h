@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <map>
+#include <string>
 
 #include "fdbrpc/DDSketch.h"
 #include "fdbrpc/HealthMonitor.h"
@@ -297,6 +298,17 @@ public:
 
 	bool currentDeliveryPeerIsTrusted() const;
 	NetworkAddress currentDeliveryPeerAddress() const;
+	// Verified peer identity (mTLS cert CN) for the message currently being delivered.
+	// Empty when no client cert is present (non-TLS connection or no mutual auth).
+	// Must be called from a request handler before any co_await — the thread-local is reset
+	// once control returns to the network loop. See src/design/key-range-authz-v1.md.
+	std::string currentDeliveryPeerIdentity() const;
+
+	// POC per-identity authz: the identity (cert CN) this process presents for locally-constructed
+	// requests (loopback / direct same-process delivery, which never re-deserialize the request so
+	// the peer identity is not set from a connection). See src/design/key-range-authz-v1.md.
+	void setLocalIdentity(std::string identity);
+	std::string localIdentity() const;
 
 	Optional<PublicKey> getPublicKeyByName(StringRef name) const;
 	// Adds or replaces a public key

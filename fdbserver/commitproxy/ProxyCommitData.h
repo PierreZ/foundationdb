@@ -224,6 +224,9 @@ struct ProxyCommitData {
 	EventMetricHandle<SingleKeyMutationDescriptor> singleKeyMutationEvent;
 	std::map<UID, Reference<StorageInfo>> storageCache;
 	std::unordered_map<UID, StorageServerInterface> tssMapping;
+	// Per-identity key-range authz policy map (POC; src/design/key-range-authz-v1.md), maintained in
+	// version order by applyMetadataMutations from \xff/authz/policy/* and read for write enforcement.
+	std::map<std::string, authz::PolicyEntry> authzPolicyMap;
 	std::map<Tag, Version> tag_popped;
 	Deque<std::pair<Version, Version>> txsPopVersions;
 	Version lastTxsPop;
@@ -422,6 +425,7 @@ inline ApplyMetadataProxyContext ProxyCommitData::getApplyMetadataProxyContext()
 		     .storageCache = &storageCache,
 		     .tag_popped = &tag_popped,
 		     .tssMapping = &tssMapping,
+		     .authzPolicyMap = &authzPolicyMap,
 		     .commitProxyIndex = commitProxyIndex,
 		     .acsBuilder = acsBuilder,
 		     .epoch = epoch,

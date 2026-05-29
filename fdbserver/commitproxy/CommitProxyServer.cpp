@@ -1338,6 +1338,40 @@ Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 			continue;
 		}
 
+		// Per-identity key-range authorization (POC; src/design/key-range-authz-v1.md).
+		// Pre-pass: if any mutation in this txn is denied by the (broadcast-maintained) policy map,
+		// reject the whole txn. Mirrors the transaction_too_old per-txn rejection (~line 836).
+		if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED) {
+			CommitTransactionRequest& tr = trs[self->transactionNum];
+			bool rejectedByACL = false;
+			for (auto const& m : tr.transaction.mutations) {
+				bool ok;
+				if (m.type == MutationRef::ClearRange) {
+					ok = authz::checkAuthorized(pProxyCommitData->authzPolicyMap,
+					                            SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN,
+					                            tr.peerIdentity(),
+					                            m.param1,
+					                            m.param2,
+					                            authz::Perm::W);
+				} else {
+					ok = authz::checkAuthorized(pProxyCommitData->authzPolicyMap,
+					                            SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN,
+					                            tr.peerIdentity(),
+					                            m.param1,
+					                            authz::Perm::W);
+				}
+				if (!ok) {
+					rejectedByACL = true;
+					break;
+				}
+			}
+			if (rejectedByACL) {
+				tr.reply.sendError(permission_denied());
+				self->committed[self->transactionNum] = ConflictBatchStatus::TransactionConflict;
+				continue;
+			}
+		}
+
 		bool checkSample = trs[self->transactionNum].commitCostEstimation.present();
 		Optional<ClientTrCommitCostEstimation>* trCost = &trs[self->transactionNum].commitCostEstimation;
 		int mutationNum = 0;

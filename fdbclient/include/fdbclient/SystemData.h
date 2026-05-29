@@ -254,6 +254,17 @@ Version decodeServerTagHistoryKey(KeyRef const&);
 Tag decodeServerTagValue(ValueRef const&);
 Key serverTagConflictKeyFor(Tag);
 
+// Per-identity key-range authorization policy (POC; src/design/key-range-authz-v1.md).
+//    "\xff/authz/policy/[[identity]]" := encoded authz::PolicyEntry (list of (range, perm) grants)
+// Written by operators/tests with ACCESS_SYSTEM_KEYS. Recognized as a metadata mutation at the
+// CommitProxy, privatized (prefix-shifted into \xff\xff/authz/policy/...) and broadcast to all
+// StorageServers on the log stream, then applied in version order at each SS — the same machinery
+// that distributes the deleted tenant map / serverTag.
+extern const KeyRangeRef authzPolicyKeys;
+extern const KeyRef authzPolicyPrefix; // public form: \xff/authz/policy/
+extern const KeyRef authzPolicyPrivatePrefix; // privatized/broadcast form: \xff\xff/authz/policy/
+Key authzPolicyKeyFor(StringRef identity);
+
 //    "\xff/tagLocalityList/[[datacenterID]]" := "[[tagLocality]]"
 //	Provides the tagLocality for the given datacenterID
 //	See "FDBTypes.h" struct Tag for more details on tagLocality
