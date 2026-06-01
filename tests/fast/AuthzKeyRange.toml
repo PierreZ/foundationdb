@@ -25,6 +25,13 @@ testTitle = "AuthzKeyRange"
 # the same tester process and commit system keys, which collides with this workload temporarily
 # switching its process identity to a non-admin CN to exercise enforcement. POC scope.
 runFailureWorkloads = false
+# Disable the post-test ConsistencyCheck workload + after-test consistency scan. These run on the
+# tester processes, which now permanently present a non-admin "client-<i>" identity (one fixed cert
+# per client, for life). A full-keyspace consistency scan is an ops/admin operation — not something a
+# layer client may do — so under enforcement it is (correctly) denied on \xff/serverList etc. In a real
+# deployment that scan runs as the ConsistencyScan role on server processes under the admin identity.
+runConsistencyCheck = false
+waitForQuiescenceEnd = false
 
     [[test.workload]]
     testName = "AuthzKeyRange"

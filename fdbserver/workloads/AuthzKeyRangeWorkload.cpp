@@ -1,22 +1,31 @@
 /*
  * AuthzKeyRangeWorkload.cpp
  *
- * POC end-to-end check for per-identity key-range authorization (v1).
+ * Randomized multi-client per-identity key-range authorization workload (POC v1).
  * See src/design/key-range-authz-v1.md.
  *
- * Scenario (single-client):
- *   1. As the admin identity, commit a policy granting a freshly-generated reader CN R access to
- *      ["k", "kz"). Writing \xff/authz/policy/<reader> requires admin; the CommitProxy recognizes
- *      it as a metadata mutation and broadcasts it (privatized) to every StorageServer, which apply
- *      it in version order — no version key, no polling.
- *   2. From the reader CN: read "k1" → expect success; read "z1" (outside grant) → permission_denied.
- *   3. From a second, unknown CN (no policy row): read "k1" → permission_denied.
+ * Each workload clientId runs on its own simulated tester process, and that process presents ONE
+ * fixed identity (`ProcessInfo::simPeerIdentity`) for its entire life — set once in the constructor,
+ * never switched. This mirrors a real client holding a single mTLS cert: identity is bound
+ * per-connection at establishment, so switching it mid-run would leave stale-identity connections
+ * behind (enforcement leak + consistency-check hang).
  *
- * Simulation identity injection: this workload sets its own simulated process's explicit
- * `simPeerIdentity` field (NOT the placement locality) to switch the identity it presents between
- * phases. Sim2Conn mints a real X509 with that CN and surfaces it as the peer's TLS CN, exactly as
- * production sources the CN from the verified client cert.
+ * clientId 0 acts as **admin** (its fixed identity == AUTHZ_INITIAL_ADMIN_CN): in setup() it writes a
+ * policy granting each non-admin client `client-<i>` RW over its own keyspace ["k<i>/", "k<i>0"). The
+ * tester framework runs ALL clients' setup() before ANY start(), and the policy is broadcast + applied
+ * version-consistently, so by start() every grant is in force.
+ *
+ * In start(), each client issues a randomized mix of get / getRange / set / clear:
+ *   - clientId 0 (admin): operates across keyspaces; every op MUST succeed (validates admin bypass).
+ *   - clientId i>0 (client-<i>): most ops target its OWN keyspace (expect allow); the rest target a
+ *     random OTHER client's keyspace (expect permission_denied). The first two ops are forced
+ *     (one cross, one own) so both paths are always exercised.
+ * Wrong outcomes raise SevError. The post-test ConsistencyCheck is disabled in the toml: it would run
+ * on these non-admin tester processes (a full-keyspace scan is an ops/admin operation, not a layer
+ * client's job).
  */
+
+#include <string>
 
 #include "fdbclient/AuthzPolicy.h"
 #include "fdbclient/FDBOptions.g.h"
@@ -29,160 +38,225 @@
 #include "fdbserver/tester/workloads.h"
 #include "flow/Trace.h"
 
-namespace {
-
-const std::string kAdminCN = "test-admin";
-
-// Switch the identity this (tester) process presents to peers. Explicit sim-only flag — replaces
-// v0's peer_cert_identity locality poke. Empty clears it (no client cert). See key-range-authz-v1.md.
-void setPresentedIdentity(std::string const& cn) {
-	ASSERT(g_network->isSimulated());
-	auto* process = g_simulator->getCurrentProcess();
-	if (cn.empty()) {
-		process->simPeerIdentity = Optional<std::string>();
-	} else {
-		process->simPeerIdentity = cn;
-	}
-}
-
-} // namespace
-
 struct AuthzKeyRangeWorkload : TestWorkload {
 	static constexpr auto NAME = "AuthzKeyRange";
 
-	bool setupOk = false;
-	bool readerAllowedOk = false;
-	bool readerDeniedOk = false;
-	bool unknownDeniedOk = false;
+	int opsPerClient;
+	double crossProbability;
+	std::string adminCN; // == AUTHZ_INITIAL_ADMIN_CN
+	std::string myCN; // this client's presented identity
+	bool isAdmin;
 
-	// Generated per run so Joshua ensembles exercise distinct identities.
-	std::string readerCN;
-	std::string unknownCN;
+	// Outcome tracking (per client; check() validates this client's own state).
+	int64_t ownOpsOk = 0; // own-keyspace ops that were correctly allowed (non-admin)
+	int64_t crossDeniedOk = 0; // cross-keyspace ops that were correctly denied (non-admin)
+	int64_t adminOpsOk = 0; // ops correctly allowed for the admin client
+	bool sawViolation = false; // any op whose allow/deny outcome was wrong
 
 	explicit AuthzKeyRangeWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {
-		readerCN = "reader-" + deterministicRandom()->randomUniqueID().shortString();
-		unknownCN = "unknown-" + deterministicRandom()->randomUniqueID().shortString();
+		opsPerClient = getOption(options, "opsPerClient"_sr, 30);
+		crossProbability = getOption(options, "crossProbability"_sr, 0.25);
+		adminCN = SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN;
+		isAdmin = (clientId == 0);
+		myCN = isAdmin ? adminCN : ("client-" + std::to_string(clientId));
+		// Each client process presents ONE fixed identity for its whole life, set here before it opens
+		// any connection — exactly like a real client holding a single mTLS cert. We must NOT switch it
+		// mid-run: identity is bound per-connection at establishment, so a later switch would leave
+		// stale-identity connections behind (cross-op enforcement leak + consistency-check hang).
+		setPresentedIdentity(myCN);
+	}
+
+	// --- key helpers: client c owns ["k<c>/", "k<c>0") ('/'=0x2f < '0'=0x30) ---
+	Key keyspaceBegin(int c) const {
+		std::string s = "k" + std::to_string(c) + "/";
+		return Key(StringRef(s));
+	}
+	Key keyspaceEnd(int c) const {
+		std::string s = "k" + std::to_string(c) + "0";
+		return Key(StringRef(s));
+	}
+	Key keyFor(int c, int idx) const {
+		std::string s = "k" + std::to_string(c) + "/" + format("%06d", idx);
+		return Key(StringRef(s));
+	}
+
+	// Sim-only: set the identity this (tester) process presents to peers. Empty clears it.
+	void setPresentedIdentity(std::string const& cn) {
+		ASSERT(g_network->isSimulated());
+		auto* p = g_simulator->getCurrentProcess();
+		if (cn.empty()) {
+			p->simPeerIdentity = Optional<std::string>();
+		} else {
+			p->simPeerIdentity = cn;
+		}
+	}
+
+	int randomOtherClient() const {
+		// Any client index != clientId (including 0 — this client has no grant for the admin's
+		// notional keyspace, so targeting it is a valid "denied" probe).
+		int j = deterministicRandom()->randomInt(0, clientCount);
+		if (j == clientId) {
+			j = (j + 1) % clientCount;
+		}
+		return j;
 	}
 
 	Future<Void> setup(Database const& cx) override {
 		if (clientId != 0) {
 			return Void();
 		}
-		return runSetup(cx, this);
+		return runSetup(cx);
 	}
 
-	Future<Void> start(Database const& cx) override {
-		if (clientId != 0) {
-			return Void();
-		}
-		return runStart(cx, this);
-	}
+	Future<Void> start(Database const& cx) override { return runStart(cx); }
 
 	Future<bool> check(Database const& cx) override {
-		if (clientId != 0) {
-			return true;
+		bool ok = !sawViolation;
+		if (isAdmin) {
+			ok = ok && adminOpsOk > 0;
+		} else {
+			ok = ok && ownOpsOk > 0 && crossDeniedOk > 0;
 		}
-		bool ok = setupOk && readerAllowedOk && readerDeniedOk && unknownDeniedOk;
 		if (!ok) {
 			TraceEvent(SevError, "AuthzKeyRangeWorkloadFailed")
-			    .detail("SetupOk", setupOk)
-			    .detail("ReaderAllowedOk", readerAllowedOk)
-			    .detail("ReaderDeniedOk", readerDeniedOk)
-			    .detail("UnknownDeniedOk", unknownDeniedOk);
+			    .detail("ClientId", clientId)
+			    .detail("Identity", myCN)
+			    .detail("SawViolation", sawViolation)
+			    .detail("OwnOpsOk", ownOpsOk)
+			    .detail("CrossDeniedOk", crossDeniedOk)
+			    .detail("AdminOpsOk", adminOpsOk);
+		} else {
+			TraceEvent(SevInfo, "AuthzKeyRangeWorkloadPassed")
+			    .detail("ClientId", clientId)
+			    .detail("Identity", myCN)
+			    .detail("OwnOpsOk", ownOpsOk)
+			    .detail("CrossDeniedOk", crossDeniedOk)
+			    .detail("AdminOpsOk", adminOpsOk);
 		}
 		return ok;
 	}
 
-	void getMetrics(std::vector<PerfMetric>& m) override {}
-
-	static Future<Void> runSetup(Database cx, AuthzKeyRangeWorkload* self) {
-		// Act as admin (the knob-bootstrapped identity) to write the policy via system keys.
-		setPresentedIdentity(kAdminCN);
-
-		authz::PolicyEntry entry;
-		entry.grants.push_back(authz::Grant("k"_sr, "kz"_sr, authz::Perm::R));
-		Value policyValue = entry.encode();
-		Key policyKey = authzPolicyKeyFor(StringRef(self->readerCN));
-
-		Transaction tr(cx);
-		bool committed = false;
-		while (!committed) {
-			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			tr.set(policyKey, policyValue);
-			Error caught(0);
-			try {
-				co_await tr.commit();
-				committed = true;
-			} catch (Error& e) {
-				caught = e;
-			}
-			if (caught.code() != 0) {
-				co_await tr.onError(caught);
-			}
-		}
-		self->setupOk = true;
-
-		// The policy mutation is broadcast + applied at every SS in version order with the commit, so
-		// a read at a version >= the commit version already sees it. A short delay is belt-and-suspenders.
-		co_await delay(2.0);
-
-		TraceEvent(SevInfo, "AuthzKeyRangeWorkloadSetupDone").detail("ReaderCN", self->readerCN);
+	void getMetrics(std::vector<PerfMetric>& m) override {
+		m.emplace_back("OwnOpsOk", ownOpsOk, Averaged::False);
+		m.emplace_back("CrossDeniedOk", crossDeniedOk, Averaged::False);
+		m.emplace_back("AdminOpsOk", adminOpsOk, Averaged::False);
 	}
 
-	static Future<Void> runStart(Database cx, AuthzKeyRangeWorkload* self) {
-		// Reader, allowed: read "k1" should succeed.
-		setPresentedIdentity(self->readerCN);
-		{
-			Transaction tr(cx);
-			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+	// clientId 0 writes one policy row per non-admin client, granting it RW on its own keyspace.
+	// (clientId 0 already presents the admin identity for its whole life — set in the constructor.)
+	Future<Void> runSetup(Database cx) {
+		Transaction tr(cx);
+		while (true) {
+			Error err;
 			try {
-				Optional<Value> v = co_await tr.get("k1"_sr);
-				(void)v;
-				self->readerAllowedOk = true;
-			} catch (Error& e) {
-				TraceEvent(SevError, "AuthzKeyRangeWorkloadReaderAllowedUnexpectedError").error(e);
-			}
-		}
-
-		// Reader, denied: read "z1" is outside the grant.
-		setPresentedIdentity(self->readerCN);
-		{
-			Transaction tr(cx);
-			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			try {
-				Optional<Value> v = co_await tr.get("z1"_sr);
-				(void)v;
-				TraceEvent(SevError, "AuthzKeyRangeWorkloadReaderDeniedReturnedValue");
-			} catch (Error& e) {
-				if (e.code() == error_code_permission_denied) {
-					self->readerDeniedOk = true;
-				} else {
-					TraceEvent(SevError, "AuthzKeyRangeWorkloadReaderDeniedUnexpectedError").error(e);
+				tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+				for (int i = 1; i < clientCount; i++) {
+					authz::PolicyEntry e;
+					e.grants.push_back(authz::Grant(keyspaceBegin(i), keyspaceEnd(i), authz::Perm::W));
+					std::string id = "client-" + std::to_string(i);
+					tr.set(authzPolicyKeyFor(StringRef(id)), e.encode());
 				}
-			}
-		}
-
-		// Unknown identity, denied: read "k1" with no policy row should fail.
-		setPresentedIdentity(self->unknownCN);
-		{
-			Transaction tr(cx);
-			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			try {
-				Optional<Value> v = co_await tr.get("k1"_sr);
-				(void)v;
-				TraceEvent(SevError, "AuthzKeyRangeWorkloadUnknownReturnedValue");
+				co_await tr.commit();
+				break;
 			} catch (Error& e) {
-				if (e.code() == error_code_permission_denied) {
-					self->unknownDeniedOk = true;
-				} else {
-					TraceEvent(SevError, "AuthzKeyRangeWorkloadUnknownUnexpectedError").error(e);
-				}
+				err = e;
 			}
+			co_await tr.onError(err);
 		}
+		TraceEvent(SevInfo, "AuthzWorkloadPoliciesWritten").detail("NonAdminClients", clientCount - 1);
+	}
 
-		// Reset to admin so any teardown traffic this process issues is allowed.
-		setPresentedIdentity(kAdminCN);
+	Future<Void> runStart(Database cx) {
+		// Identity was fixed once in the constructor (myCN) — no mid-run switching.
+		TraceEvent(SevInfo, "AuthzWorkloadClientStart")
+		    .detail("ClientId", clientId)
+		    .detail("Identity", myCN)
+		    .detail("IsAdmin", isAdmin)
+		    .detail("ClientCount", clientCount);
+
+		for (int op = 0; op < opsPerClient; op++) {
+			int target;
+			bool expectAllowed;
+			if (isAdmin) {
+				// Admin operates anywhere; everything must be allowed.
+				target = clientCount > 1 ? deterministicRandom()->randomInt(1, clientCount) : 0;
+				expectAllowed = true;
+			} else {
+				bool goElsewhere;
+				if (op == 0) {
+					goElsewhere = true; // force one cross-keyspace probe (expect deny)
+				} else if (op == 1) {
+					goElsewhere = false; // force one own-keyspace op (expect allow)
+				} else {
+					goElsewhere = deterministicRandom()->random01() < crossProbability;
+				}
+				target = goElsewhere ? randomOtherClient() : clientId;
+				expectAllowed = !goElsewhere;
+			}
+			co_await doRandomOp(cx, target, expectAllowed);
+		}
+		// No reset: this process keeps its fixed identity for life (like a real client's cert).
+	}
+
+	Future<Void> doRandomOp(Database cx, int target, bool expectAllowed) {
+		int idx = deterministicRandom()->randomInt(0, 1000);
+		Key k = keyFor(target, idx);
+		int opType = deterministicRandom()->randomInt(0, 4); // 0 get, 1 getRange, 2 set, 3 clear
+		Key kEnd = keyFor(target, idx + 10);
+		Transaction tr(cx);
+		while (true) {
+			Error err;
+			try {
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+				if (opType == 0) {
+					Optional<Value> v = co_await tr.get(k);
+					(void)v;
+				} else if (opType == 1) {
+					RangeResult r = co_await tr.getRange(KeyRangeRef(k, kEnd), 10);
+					(void)r;
+				} else if (opType == 2) {
+					std::string v = deterministicRandom()->randomAlphaNumeric(8);
+					tr.set(k, StringRef(v));
+					co_await tr.commit();
+				} else {
+					tr.clear(k);
+					co_await tr.commit();
+				}
+				// Operation succeeded.
+				if (!expectAllowed) {
+					TraceEvent(SevError, "AuthzWorkloadExpectedDenyButAllowed")
+					    .detail("ClientId", clientId)
+					    .detail("Identity", myCN)
+					    .detail("Target", target)
+					    .detail("Key", k)
+					    .detail("OpType", opType);
+					sawViolation = true;
+				} else if (isAdmin) {
+					++adminOpsOk;
+				} else {
+					++ownOpsOk;
+				}
+				co_return;
+			} catch (Error& e) {
+				err = e;
+			}
+			if (err.code() == error_code_permission_denied) {
+				if (expectAllowed) {
+					TraceEvent(SevError, "AuthzWorkloadExpectedAllowButDenied")
+					    .detail("ClientId", clientId)
+					    .detail("Identity", myCN)
+					    .detail("Target", target)
+					    .detail("Key", k)
+					    .detail("OpType", opType);
+					sawViolation = true;
+				} else {
+					++crossDeniedOk;
+				}
+				co_return; // an authorization decision is final — do not retry
+			}
+			co_await tr.onError(err); // retryable error (not_committed, transaction_too_old, …)
+		}
 	}
 };
 

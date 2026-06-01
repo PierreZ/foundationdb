@@ -1625,6 +1625,13 @@ static Future<Void> connectionReader(TransportData* transport,
 
 				if (!expectConnectPacket) {
 					if (compatible || peerProtocolVersion.hasStableInterfaces()) {
+						// Bind the peer identity at REQUEST time, not connection-establishment time:
+						// re-read the cert identity for this batch of packets. In production this is a
+						// no-op (SSLConnection caches the cert CN extracted once at handshake; it never
+						// changes), so per-delivery == per-connection. In simulation it makes the
+						// identity the receiver sees independent of when the connection happened to open
+						// (the presented identity is a per-process property here). See key-range-authz-v1.md.
+						peerIdentity = conn->getPeerCertIdentity();
 						scanPackets(transport,
 						            unprocessed_begin,
 						            unprocessed_end,

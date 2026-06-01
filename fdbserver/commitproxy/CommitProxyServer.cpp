@@ -1343,31 +1343,45 @@ Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 		// reject the whole txn. Mirrors the transaction_too_old per-txn rejection (~line 836).
 		if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED) {
 			CommitTransactionRequest& tr = trs[self->transactionNum];
+			std::string const& adminCN = SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN;
 			bool rejectedByACL = false;
+			KeyRef deniedKey;
 			for (auto const& m : tr.transaction.mutations) {
 				bool ok;
 				if (m.type == MutationRef::ClearRange) {
 					ok = authz::checkAuthorized(pProxyCommitData->authzPolicyMap,
-					                            SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN,
+					                            adminCN,
 					                            tr.peerIdentity(),
 					                            m.param1,
 					                            m.param2,
 					                            authz::Perm::W);
 				} else {
-					ok = authz::checkAuthorized(pProxyCommitData->authzPolicyMap,
-					                            SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN,
-					                            tr.peerIdentity(),
-					                            m.param1,
-					                            authz::Perm::W);
+					ok = authz::checkAuthorized(
+					    pProxyCommitData->authzPolicyMap, adminCN, tr.peerIdentity(), m.param1, authz::Perm::W);
 				}
 				if (!ok) {
 					rejectedByACL = true;
+					deniedKey = m.param1;
 					break;
 				}
 			}
+			// Observability (POC): log denials always, and commits by non-admin (layer) identities;
+			// admin commits (cluster-internal traffic) are suppressed to avoid flooding the trace.
+			bool isAdmin = !adminCN.empty() && tr.peerIdentity() == adminCN;
+			if (rejectedByACL || !isAdmin) {
+				TraceEvent(SevInfo, "AuthzCommitCheck", pProxyCommitData->dbgid)
+				    .detail("Identity", tr.peerIdentity())
+				    .detail("Mutations", tr.transaction.mutations.size())
+				    .detail("Decision", rejectedByACL ? "deny" : "allow")
+				    .detail("DeniedKey", rejectedByACL ? deniedKey : ""_sr)
+				    .detail("PolicyRows", pProxyCommitData->authzPolicyMap.size());
+			}
 			if (rejectedByACL) {
 				tr.reply.sendError(permission_denied());
-				self->committed[self->transactionNum] = ConflictBatchStatus::TransactionConflict;
+				// Mark as LockReject, not Conflict: the reply loop treats LockReject as "error already
+				// sent" and skips it, whereas Conflict would send a second (not_committed) reply to the
+				// already-set promise and trip the canBeSet() assertion in SAV::sendError.
+				self->committed[self->transactionNum] = ConflictBatchStatus::TransactionLockReject;
 				continue;
 			}
 		}

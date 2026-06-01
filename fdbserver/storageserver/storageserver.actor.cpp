@@ -2145,6 +2145,36 @@ std::shared_ptr<MoveInShard> StorageServer::getMoveInShard(const UID& dataMoveId
 	return shard;
 }
 
+// Per-identity key-range authorization check + observability (POC; src/design/key-range-authz-v1.md).
+// Returns true if `identity` may perform `perm` over [begin, end); returns true unconditionally when
+// AUTHZ_ENFORCEMENT_ENABLED is off. Logs the decision at SevInfo for non-admin (layer) identities and
+// for every denial; admin allows are suppressed to avoid flooding the trace with cluster-internal
+// traffic that all resolves to the admin identity.
+static bool ssAuthzCheck(StorageServer* data,
+                         const char* op,
+                         std::string const& identity,
+                         KeyRef begin,
+                         KeyRef end,
+                         authz::Perm perm) {
+	if (!SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED) {
+		return true;
+	}
+	std::string const& adminCN = SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN;
+	bool allowed = authz::checkAuthorized(data->authzPolicyMap, adminCN, identity, begin, end, perm);
+	bool isAdmin = !adminCN.empty() && identity == adminCN;
+	if (!allowed || !isAdmin) {
+		TraceEvent(SevInfo, "AuthzSSCheck", data->thisServerID)
+		    .detail("Op", op)
+		    .detail("Identity", identity)
+		    .detail("Begin", begin)
+		    .detail("End", end)
+		    .detail("Perm", (int)perm)
+		    .detail("Decision", allowed ? "allow" : "deny")
+		    .detail("PolicyRows", data->authzPolicyMap.size());
+	}
+	return allowed;
+}
+
 Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 	int64_t resultSize = 0;
 	Span span("SS:getValue"_loc, req.spanContext);
@@ -2152,15 +2182,7 @@ Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 	// getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.first();
 
 	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
-	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED &&
-	    !authz::checkAuthorized(
-	        data->authzPolicyMap, SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN, req.peerIdentity(), req.key, authz::Perm::R)) {
-		TraceEvent(SevWarnAlways, "AuthzSSDenyGetValue", data->thisServerID)
-		    .detail("Identity", req.peerIdentity())
-		    .detail("AdminCN", SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN)
-		    .detail("PolicyRows", data->authzPolicyMap.size())
-		    .detail("Client", req.reply.getEndpoint().getPrimaryAddress())
-		    .detail("Key", req.key);
+	if (!ssAuthzCheck(data, "getValue", req.peerIdentity(), req.key, keyAfter(req.key), authz::Perm::R)) {
 		req.reply.sendError(permission_denied());
 		co_return;
 	}
@@ -3338,18 +3360,7 @@ Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
 	// Single check covering the requested key range; mixed-permission denials surface a generic
 	// permission_denied so the boundary key is not revealed.
-	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && !authz::checkAuthorized(data->authzPolicyMap,
-	                                                                       SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN,
-	                                                                       req.peerIdentity(),
-	                                                                       req.begin.getKey(),
-	                                                                       req.end.getKey(),
-	                                                                       authz::Perm::R)) {
-		TraceEvent(SevWarnAlways, "AuthzSSDenyGetKeyValues", data->thisServerID)
-		    .detail("Identity", req.peerIdentity())
-		    .detail("AdminCN", SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN)
-		    .detail("PolicyRows", data->authzPolicyMap.size())
-		    .detail("Begin", req.begin.getKey())
-		    .detail("End", req.end.getKey());
+	if (!ssAuthzCheck(data, "getKeyValues", req.peerIdentity(), req.begin.getKey(), req.end.getKey(), authz::Perm::R)) {
 		req.reply.sendError(permission_denied());
 		co_return;
 	}
@@ -6035,16 +6046,8 @@ Future<Void> getKeyQ(StorageServer* data, GetKeyRequest req) {
 	int64_t resultSize = 0;
 
 	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
-	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && !authz::checkAuthorized(data->authzPolicyMap,
-	                                                                       SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN,
-	                                                                       req.peerIdentity(),
-	                                                                       req.sel.getKey(),
-	                                                                       authz::Perm::R)) {
-		TraceEvent(SevWarnAlways, "AuthzSSDenyGetKey", data->thisServerID)
-		    .detail("Identity", req.peerIdentity())
-		    .detail("AdminCN", SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN)
-		    .detail("PolicyRows", data->authzPolicyMap.size())
-		    .detail("Key", req.sel.getKey());
+	if (!ssAuthzCheck(
+	        data, "getKey", req.peerIdentity(), req.sel.getKey(), keyAfter(req.sel.getKey()), authz::Perm::R)) {
 		req.reply.sendError(permission_denied());
 		co_return;
 	}
@@ -9559,19 +9562,32 @@ private:
 			// order so every SS maintains the authority map without polling or a self-read.
 			if (m.type == MutationRef::SetValue) {
 				std::string identity = m.param1.substr(1).removePrefix(authzPolicyPrefix).toString();
-				data->authzPolicyMap[identity] = authz::PolicyEntry::decode(m.param2);
+				authz::PolicyEntry entry = authz::PolicyEntry::decode(m.param2);
+				TraceEvent(SevInfo, "AuthzPolicyApplied", data->thisServerID)
+				    .detail("Identity", identity)
+				    .detail("Grants", entry.grants.size())
+				    .detail("Version", ver)
+				    .detail("MapSize", data->authzPolicyMap.size());
+				data->authzPolicyMap[identity] = std::move(entry);
 			} else {
 				// Revoke: clear over the privatized [param1, param2) policy range.
 				KeyRef beginPub = m.param1.substr(1);
 				KeyRef endPub = m.param2.substr(1);
+				int cleared = 0;
 				for (auto it = data->authzPolicyMap.begin(); it != data->authzPolicyMap.end();) {
 					Key fullKey = authzPolicyKeyFor(it->first);
 					if (beginPub <= fullKey && fullKey < endPub) {
 						it = data->authzPolicyMap.erase(it);
+						++cleared;
 					} else {
 						++it;
 					}
 				}
+				TraceEvent(SevInfo, "AuthzPolicyCleared", data->thisServerID)
+				    .detail("Begin", beginPub)
+				    .detail("End", endPub)
+				    .detail("Cleared", cleared)
+				    .detail("Version", ver);
 			}
 		} else {
 			ASSERT(false); // Unknown private mutation

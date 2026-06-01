@@ -607,9 +607,10 @@ private:
 		}
 		// Update the proxy-local map (used for write-side enforcement). Done on both the normal and
 		// initialCommit (recovery replay) paths.
+		std::string identity = m.param1.removePrefix(authzPolicyPrefix).toString();
+		authz::PolicyEntry entry = authz::PolicyEntry::decode(m.param2);
 		if (authzPolicyMap) {
-			std::string identity = m.param1.removePrefix(authzPolicyPrefix).toString();
-			(*authzPolicyMap)[identity] = authz::PolicyEntry::decode(m.param2);
+			(*authzPolicyMap)[identity] = entry;
 		}
 		if (!initialCommit) {
 			txnStateStore->set(KeyValueRef(m.param1, m.param2));
@@ -623,7 +624,11 @@ private:
 			MutationRef privatized = m;
 			privatized.clearChecksumAndAccumulativeIndex();
 			privatized.param1 = m.param1.withPrefix(systemKeys.begin, arena);
-			TraceEvent(SevDebug, "SendingPrivatized_AuthzPolicy", dbgid).detail("M", privatized);
+			TraceEvent(SevInfo, "AuthzPolicyBroadcast", dbgid)
+			    .detail("Identity", identity)
+			    .detail("Grants", entry.grants.size())
+			    .detail("Tags", allTags.size())
+			    .detail("Version", version);
 			if (acsBuilder != nullptr) {
 				updateMutationWithAcsAndAddMutationToAcsBuilder(
 				    acsBuilder, privatized, allTags, accumulativeChecksumIndex, epoch.get(), version, dbgid);
@@ -662,7 +667,10 @@ private:
 			privatized.type = MutationRef::ClearRange;
 			privatized.param1 = rangeToClear.begin.withPrefix(systemKeys.begin, arena);
 			privatized.param2 = rangeToClear.end.withPrefix(systemKeys.begin, arena);
-			TraceEvent(SevDebug, "SendingPrivatized_ClearAuthzPolicy", dbgid).detail("M", privatized);
+			TraceEvent(SevInfo, "AuthzPolicyBroadcastClear", dbgid)
+			    .detail("Range", rangeToClear)
+			    .detail("Tags", allTags.size())
+			    .detail("Version", version);
 			if (acsBuilder != nullptr) {
 				updateMutationWithAcsAndAddMutationToAcsBuilder(
 				    acsBuilder, privatized, allTags, accumulativeChecksumIndex, epoch.get(), version, dbgid);
