@@ -1152,6 +1152,49 @@ Future<Void> applyMetadataToCommittedTransactions(CommitBatchContext* self) {
 	ProxyCommitData* const pProxyCommitData = self->pProxyCommitData;
 	auto& trs = self->trs;
 
+	// Per-identity key-range authz (POC; src/design/key-range-authz-v2.md addendum): cap the number
+	// of distinct policy identities at AUTHZ_MAX_IDENTITIES. This MUST run before the
+	// applyMetadataMutations loop below — by the assign-stage pre-pass the batch's metadata has
+	// already been applied to the proxy map, the txnStateStore and the broadcast stream, so a later
+	// rejection could not undo the row. Updates to existing identities and clears always pass.
+	// Recovery replay (initialCommit) never runs this function, so saved rows always restore.
+	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED) {
+		std::set<std::string> batchNewIdentities; // new identities accepted earlier in this batch
+		for (int t = 0; t < trs.size(); t++) {
+			if (!(self->committed[t] == ConflictBatchStatus::TransactionCommitted &&
+			      (!self->locked || trs[t].isLockAware()))) {
+				continue;
+			}
+			std::set<std::string> txnNewIdentities;
+			for (auto const& m : trs[t].transaction.mutations) {
+				if (m.type == MutationRef::SetValue && m.param1.startsWith(authzPolicyPrefix)) {
+					std::string identity = m.param1.removePrefix(authzPolicyPrefix).toString();
+					if (!pProxyCommitData->authzPolicyMap.count(identity) && !batchNewIdentities.count(identity)) {
+						txnNewIdentities.insert(identity);
+					}
+				}
+			}
+			if (txnNewIdentities.empty()) {
+				continue;
+			}
+			if (pProxyCommitData->authzPolicyMap.size() + batchNewIdentities.size() + txnNewIdentities.size() >
+			    (size_t)SERVER_KNOBS->AUTHZ_MAX_IDENTITIES) {
+				TraceEvent(SevWarn, "AuthzIdentityCapExceeded", pProxyCommitData->dbgid)
+				    .suppressFor(1.0)
+				    .detail("Identity", trs[t].peerIdentity())
+				    .detail("ExistingIdentities", pProxyCommitData->authzPolicyMap.size())
+				    .detail("NewInBatch", batchNewIdentities.size())
+				    .detail("NewInTxn", txnNewIdentities.size())
+				    .detail("MaxIdentities", SERVER_KNOBS->AUTHZ_MAX_IDENTITIES);
+				trs[t].reply.sendError(authz_too_many_identities());
+				// LockReject (not Conflict): the reply loop treats LockReject as "error already sent".
+				self->committed[t] = ConflictBatchStatus::TransactionLockReject;
+			} else {
+				batchNewIdentities.insert(txnNewIdentities.begin(), txnNewIdentities.end());
+			}
+		}
+	}
+
 	int t;
 	for (t = 0; t < trs.size() && !self->forceRecovery; t++) {
 		if (self->committed[t] == ConflictBatchStatus::TransactionCommitted &&

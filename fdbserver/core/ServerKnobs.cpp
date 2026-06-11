@@ -1379,4 +1379,5 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	// Per-identity key-range authorization (POC; see src/design/key-range-authz-v1.md)
 	init(AUTHZ_ENFORCEMENT_ENABLED, false);
 	init(AUTHZ_INITIAL_ADMIN_CN, "");
+	init( AUTHZ_MAX_IDENTITIES, 32 ); if( randomize && buggify() ) AUTHZ_MAX_IDENTITIES = deterministicRandom()->randomInt(4, 33);
 }

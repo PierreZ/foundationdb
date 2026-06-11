@@ -1314,6 +1314,8 @@ public:
 	bool AUTHZ_ENFORCEMENT_ENABLED; // Master switch. When false, the data-plane check returns allow.
 	std::string AUTHZ_INITIAL_ADMIN_CN; // Admin identity (cert CN). Cluster/backup processes present this
 	                                    // CN; bootstraps the first policy write. Empty disables the admin bypass.
+	int AUTHZ_MAX_IDENTITIES; // Cap on distinct policy identities; a commit creating a new identity beyond
+	                          // the cap is rejected with authz_too_many_identities. Updates always succeed.
 
 	ServerKnobs(Randomize, ClientKnobs*, IsSimulated);
 	void initialize(Randomize, ClientKnobs*, IsSimulated);

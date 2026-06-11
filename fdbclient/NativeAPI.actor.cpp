@@ -4527,7 +4527,8 @@ ACTOR static Future<Void> tryCommit(Reference<TransactionState> trState, CommitT
 			    e.code() != error_code_batch_transaction_throttled && e.code() != error_code_tag_throttled &&
 			    e.code() != error_code_process_behind && e.code() != error_code_future_version &&
 			    e.code() != error_code_transaction_throttled_hot_shard &&
-			    e.code() != error_code_transaction_rejected_range_locked && e.code() != error_code_permission_denied) {
+			    e.code() != error_code_transaction_rejected_range_locked && e.code() != error_code_permission_denied &&
+			    e.code() != error_code_authz_too_many_identities) {
 				TraceEvent(SevError, "TryCommitError").error(e);
 			}
 			if (trState->trLogInfo)
