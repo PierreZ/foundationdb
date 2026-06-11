@@ -170,12 +170,6 @@ CertAndKeyRef makePasswCert(Arena& arena, StringRef password);
 // Parse a PEM-encoded X509 certificate into a refcounted native handle (X509_free deleter).
 std::shared_ptr<X509> readX509CertPem(StringRef x509CertPem);
 
-// Mint a self-signed X509 with the given commonName. Returned X509 is owned via shared_ptr
-// and freed via X509_free. Used by the simulator (POC per-identity authz) to give simulated
-// processes real certs so the production CN-extraction code path can run against them.
-// See src/design/key-range-authz-v1.md.
-std::shared_ptr<X509> makeSelfSignedCertWithCN(StringRef commonName);
-
 } // namespace mkcert
 
 #endif /*MKCERT_H*/

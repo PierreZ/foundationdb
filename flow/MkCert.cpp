@@ -375,19 +375,6 @@ CertAndKeyRef makePasswCert(Arena& arena, StringRef password) {
 	return CertAndKeyRef::make(arena, spec, CertAndKeyRef{}, password);
 }
 
-std::shared_ptr<X509> makeSelfSignedCertWithCN(StringRef commonName) {
-	auto arena = Arena();
-	auto spec = CertSpecRef::make(arena, CertKind(Server{}));
-	// Replace the default commonName entry produced by CertSpecRef::make.
-	for (auto& entry : spec.subjectName) {
-		if (entry.field == "commonName"_sr) {
-			entry.bytes = StringRef(arena, commonName);
-		}
-	}
-	auto pem = CertAndKeyRef::make(arena, spec, CertAndKeyRef{} /* self-signed */);
-	return readX509CertPem(pem.certPem);
-}
-
 } // namespace mkcert
 
 // Shared X509 CN extractor — used by both flow/Net2.cpp::SSLConnection (production TLS path)

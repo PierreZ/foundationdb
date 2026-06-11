@@ -747,14 +747,16 @@ Future<ISimulator::KillType> simulatedFDBDRebooter(Reference<IClusterConnectionR
 		                                                           coordFolder->c_str(),
 		                                                           protocolVersion,
 		                                                           isDr);
-		// POC per-identity authz (src/design/key-range-authz-v1.md): every simulated process — cluster
-		// nodes, backup, AND testers/test infrastructure — defaults to the admin identity, so all
-		// cluster-internal and test-harness traffic (recovery, data distribution, ChangeConfig,
-		// consistency checks) passes the SS/proxy authz check. The authz workload temporarily overrides
-		// its own process identity (via the workload helper) to a non-admin CN to exercise enforcement.
-		// This is the simulation analog of deploying the admin cert to every cluster/ops process.
-		if (!SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN.empty()) {
-			process->simPeerIdentity = SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN;
+		// POC per-identity authz (src/design/key-range-authz-v2.md addendum): when authz is enabled
+		// in the cluster, cluster/backup processes are issued the admin identity at creation — the
+		// simulation analog of deploying the admin cert to every cluster/ops process — so
+		// cluster-internal traffic (recovery, data distribution) passes the SS/proxy authz check.
+		// Tester processes are NOT issued an identity here: each test client is issued its own fixed
+		// CN exactly once (workload constructor), like a real layer client holding a single mTLS
+		// cert. Identity is write-once per process.
+		if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && !SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN.empty() &&
+		    processClass != ProcessClass::TesterClass) {
+			process->issueIdentity(SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN);
 		}
 		co_await g_simulator->onProcess(
 		    process,

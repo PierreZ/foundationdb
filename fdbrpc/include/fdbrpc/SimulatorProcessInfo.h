@@ -38,10 +38,6 @@
 
 struct MachineInfo;
 
-// Forward-declare OpenSSL X509 so consumers don't need <openssl/x509.h>.
-struct x509_st;
-typedef struct x509_st X509;
-
 namespace simulator {
 
 struct ProcessInfo : NonCopyable {
@@ -77,16 +73,12 @@ struct ProcessInfo : NonCopyable {
 	ProtocolVersion protocolVersion;
 	bool excludeFromRestarts = false;
 
-	// POC per-identity authz (src/design/key-range-authz-v1.md): the mTLS identity this simulated
-	// process presents to peers. Set explicitly (the workload helper / SimulatedCluster), NOT via
-	// the placement locality. Sim2Conn::getPeerCertIdentity() mints a real X509 with CN ==
-	// simPeerIdentity and extracts it through the same OpenSSL parser production SSLConnection uses.
-	// Empty => no client identity (untrusted layer client with no cert).
+	// POC per-identity authz (src/design/key-range-authz-v2.md addendum): the mTLS identity this
+	// simulated process presents to peers — the sim analog of the CN in an ops-issued client cert.
+	// Issued at most once via issueIdentity() and immutable for the process's life, so a connection's
+	// peer identity can never change mid-stream and a workload cannot forge an identity its process
+	// was not issued. Empty => no client identity (untrusted layer client with no cert).
 	Optional<std::string> simPeerIdentity;
-	// Mint-cache for simPeerIdentity: the X509 minted for the current CN, regenerated when the CN
-	// changes (workloads switch identities between phases). shared_ptr deleter is X509_free.
-	std::shared_ptr<X509> peerCert;
-	std::string peerCertCN; // CN baked into peerCert; used to detect simPeerIdentity changes.
 
 	std::vector<ProcessInfo*> childs;
 
@@ -106,6 +98,14 @@ struct ProcessInfo : NonCopyable {
 	}
 
 	Future<KillType> onShutdown() { return shutdownSignal.getFuture(); }
+
+	// Issue this process its (sole, immutable) authz identity. Write-once: re-issuing a different
+	// CN is a bug — identity is bound for the process's life, like a real client's mTLS cert.
+	// Re-issuing the same CN is a no-op (workload re-construction).
+	void issueIdentity(std::string const& cn) {
+		ASSERT(!simPeerIdentity.present() || simPeerIdentity.get() == cn);
+		simPeerIdentity = cn;
+	}
 
 	bool isSpawnedKVProcess() const {
 		// SOMEDAY: use a separate bool may be better?
