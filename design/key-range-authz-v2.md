@@ -13,6 +13,52 @@ for policy distribution, and **identity decoupled from `isTrustedPeer`**.
 
 ---
 
+## Addendum (2026-06-11) — decisions taken during the durability/identity/cap increment
+
+User-directed re-scope; these supersede the matching sections below where they differ.
+
+1. **§2.8 superseded (sim TLS strategy).** The trust authority + fake-handshake
+   presented-vs-issued check + failure-injection dice + bounded handshake-slot `FlowLock` are
+   **dropped for the POC** in favor of the most-KISS model: in simulation, identity is a plain
+   **immutable string issued at most once per process** (`ProcessInfo::issueIdentity`, ASSERT on
+   re-issue). `Sim2Conn::getPeerCertIdentity()` returns the peer process's issued string directly —
+   the X509 mint+parse roundtrip was deleted as tautological (it parsed a cert minted from the very
+   string it returned). Forge-resistance is structural: there is no API to present an identity a
+   process was not issued, and immutability removes the mid-life-switch hazard. Everything in sim
+   shares one address space, so a modeled handshake check defends against an attacker that cannot
+   exist there; the real-TLS contract (`AuthzTlsTest`) and TLS-exhaustion modeling stay deferred to
+   the feature doc.
+2. **Proxies confirmed reboot-proof** (no work needed): policy rows are written to the
+   `txnStateStore` on the live path and a freshly recruited proxy rebuilds its map from the
+   recovery replay (`initialCommit`) of that store.
+3. **SS durability gains a third leg.** Besides persist (`persistAuthzPolicyKeys` in
+   `applyPrivateData`) + restore (`restoreDurableState`), a **freshly recruited** SS does a
+   one-shot `\xff/authz/policy/*` read at registration (`initAuthzPolicyMap`, the tenant
+   `initTenantMap` analog) — its tag only receives broadcasts from its registration version on.
+   The fetched rows are **written to storage immediately** (`storage.writeKeyValue`, made durable by
+   the new-server commit that follows): the tenant template's `initTenantMap` populated the map
+   in-memory only (`insertTenant(..., persist=false)`), so a fresh-then-rebooted SS came back empty
+   and wrongly denied. Found by sim (seed 1035 sweep) — the tenant code shipped with this hole.
+3b. **§2.3's placement fix for the three existing read checks was pulled INTO this increment**
+   (the endpoint-coverage expansion — stream/mapped/watch — stays deferred). The same seed-1035
+   sweep proved §2.6's claim that durability and placement compose: an SS that reboots before the
+   policy versions are durable restores an (correctly) empty map and replays the mutations from
+   `durableVersion+1` — but the v1 entry-placed check consulted the map *before* `waitForVersion`,
+   denying granted clients during the replay window. The checks in `getValueQ` / `getKeyValuesQ` /
+   `getKeyQ` now run after `waitForVersion` + `findKey` against the resolved range/key (also closing
+   the selector-offset bypass for these endpoints); `permission_denied` joined `canReplyWith`.
+4. **`AUTHZ_MAX_IDENTITIES` (=32, sim-randomized 4–32 via `randomize && buggify()`).** Enforced at
+   the CommitProxy **before** `applyMetadataToCommittedTransactions` — by the time the
+   assign-stage pre-pass runs, the batch's metadata has already been applied to the proxy map, the
+   `txnStateStore` and the broadcast stream, so a later rejection could not undo the row. Rejection
+   error: `authz_too_many_identities` (6006).
+5. **Known issue (feeds §2.5, still deferred):** the v1 write-ACL check sits in the assign-stage
+   pre-pass, i.e. *after* metadata application — a denied transaction that wrote `\xff/authz/*`
+   has already had its policy mutation applied and broadcast. The §2.5 subspace guard must move to
+   the same pre-metadata hook the cap check now uses.
+
+---
+
 ## 0. Start here (POC orientation)
 
 This is the design for a POC. A fresh instance of Claude is intended to pick this up after a
