@@ -13,6 +13,49 @@ for policy distribution, and **identity decoupled from `isTrustedPeer`**.
 
 ---
 
+## Feature recap
+
+**Per-identity key-range authorization for FoundationDB**: every client connection carries an
+identity (the verified mTLS client-cert CN), and per-identity policies grant Read/Write over key
+ranges. Enforcement is authoritative on the server — writes at the CommitProxy, reads at the
+StorageServers — so a layer client can be confined to its keyspace without trusting client-side
+code. This is a standalone feature, deliberately **not** a revival of tenants/metacluster: no key
+prefixing, no metadata cluster, just grants over the existing keyspace. Everything is gated by one
+knob (`AUTHZ_ENFORCEMENT_ENABLED`, default **off**) — zero behavior change when disabled.
+
+How it works:
+
+- **Policy storage & distribution.** One row per identity at `\xff/authz/policy/<identity>` (a
+  list of range grants). A policy write is recognized at the CommitProxy as a metadata mutation
+  and broadcast to every storage server through the existing TLog stream — privatized, tagged to
+  all SS tags, applied in version order (the mechanism the deleted tenant map used). No polling,
+  no background actors, no new connections; every server converges on the same policy at the same
+  commit versions. Proxies rebuild their map from the `txnStateStore` at recovery.
+- **Version-correct read checks.** SS-side checks run after `waitForVersion` and after KeySelector
+  resolution: the policy map is exact as-of the read version (fail-closed — a revoke denies the
+  revoked identity's own in-flight reads) and the check covers the keys actually read. A plain
+  map suffices; no versioned data structure.
+- **Reboot durability (SS), three legs.** Policy rows persist through the SS mutation log on
+  apply; restore from disk before serving reads; a freshly recruited SS one-shot-reads the policy
+  at registration (its brand-new broadcast tag cannot see history) and persists it immediately.
+- **Bounded state.** `AUTHZ_MAX_IDENTITIES` (default 32, sim-randomized 4–32) caps distinct
+  identities, enforced at the proxy before metadata application (`authz_too_many_identities`).
+- **Identity in simulation.** Each simulated process is issued one immutable identity string
+  (write-once) — forgery and mid-life switches are impossible by construction; no simulated TLS
+  handshake.
+
+Status / evidence: ~1,100 lines across 26 files on this branch. Randomized multi-client sim
+workload (allow/deny matrix, admin bypass, cap-adaptive grants + overflow rejection) running with
+fault injection (machine kills/reboots, random data movement). Simulation caught two real bugs
+during hardening (a fresh-recruit durability hole the original tenant-map code also shipped with,
+and a wrong-deny window during post-reboot tlog replay — both fixed). 100/100 local seeds;
+Joshua ensembles green (1000/1000; a 100k-run ensemble in progress). Remaining before a feature
+proposal: read coverage for stream/mapped/watch endpoints, the admin-only `\xff/authz/*` subspace
+guard (§2.5), per-role admin identities, production identity derivation + the real-TLS contract
+test, and operator UX (fdbcli / special keys).
+
+---
+
 ## Addendum (2026-06-11) — decisions taken during the durability/identity/cap increment
 
 User-directed re-scope; these supersede the matching sections below where they differ.
@@ -26,8 +69,7 @@ User-directed re-scope; these supersede the matching sections below where they d
    string it returned). Forge-resistance is structural: there is no API to present an identity a
    process was not issued, and immutability removes the mid-life-switch hazard. Everything in sim
    shares one address space, so a modeled handshake check defends against an attacker that cannot
-   exist there; the real-TLS contract (`AuthzTlsTest`) and TLS-exhaustion modeling stay deferred to
-   the feature doc.
+   exist there; the real-TLS contract (`AuthzTlsTest`) stays deferred to the feature doc.
 2. **Proxies confirmed reboot-proof** (no work needed): policy rows are written to the
    `txnStateStore` on the live path and a freshly recruited proxy rebuilds its map from the
    recovery replay (`initialCommit`) of that store.
@@ -216,11 +258,6 @@ seeded failure-injection surface. **No real OpenSSL handshake in sim.**
   `CONNECTION_MONITOR_TIMEOUT` paths), and contention on a **bounded sim handshake-slot resource**
   (a sim-wide `FlowLock`, knob-controlled) modeling production's global `handshakeLock` + 64-thread
   `sslHandshakerPool` (`Net2.cpp`).
-- **TLS exhaustion on reboot = a deterministic test (the Apple concern).** Cluster reboot makes the
-  full reconnection mesh contend for the handshake slots → measurable recovery delay. Assert the
-  cluster recovers, enforcement stays correct, **no fail-open window**, and the authz feature does
-  not worsen it (policy rides the existing log stream — zero new connections/handshakes). Composes
-  with §2.6 (reboot also repopulates the policy map).
 - **Production local-identity + unify.** Derive the local process CN from its *own* loaded cert
   (`LoadedTLSConfig::getCertificateBytes` → `SSL_CTX_get0_certificate` →
   `extractCommonNameFromX509`) at `fdbserver.cpp` after `initTLS()`, then `setLocalIdentity`. Drive
@@ -242,11 +279,9 @@ seeded failure-injection surface. **No real OpenSSL handshake in sim.**
   scaling ceiling), keeps the per-read linear grant scan trivial, and makes the plain map a
   non-issue. A first feature does not need unbounded identities.
 - **Why a *fake* TLS boundary, not a real sim handshake.** A real handshake reproduces OpenSSL
-  (the anti-pattern); the code only touches the *verified identity*, the *handshake outcome*, and
-  the *bounded handshake resource*. A proper fake models exactly those, proves forge-resistance via
-  an issued-vs-presented check, and — crucially — becomes the control surface to inject the
-  **TLS-exhaustion-on-reboot** failure Apple flagged. `AuthzTlsTest` (real OpenSSL) is the contract
-  that keeps the fake honest.
+  (the anti-pattern); the code only touches the *verified identity* and the *handshake outcome*.
+  A proper fake models exactly those and proves forge-resistance via an issued-vs-presented check.
+  `AuthzTlsTest` (real OpenSSL) is the contract that keeps the fake honest.
 - **Why a single admin CN, not the privileged-peers grammar.** Reusing `--tls-verify-peers` for an
   authz bypass conflates two trust layers, is coarse (a prefix match = god mode), sits outside the
   policy model, and needs O/OU/SAN cert-field plumbing the CN path doesn't. Per-role admin, when
@@ -265,7 +300,7 @@ seeded failure-injection surface. **No real OpenSSL handshake in sim.**
 | 3 | Reboot durability: `persistAuthzPolicyKeys` + restore in `restoreDurableState`. | None |
 | 4 | Cluster-admin identity: single `AUTHZ_INITIAL_ADMIN_CN` (CN-equality bypass). | None until knob on |
 | 5 | Verified TLS fake: sim trust authority (issued identity), fake handshake with presented-vs-issued + failure injection + bounded handshake slots; production local-identity; `AuthzTlsTest` contract. | Sim/test only |
-| 6 | Workloads: enforcement, forge-resistance, admin-bypass, reboot-under-exhaustion. Flip the knob. | Authz live (opt-in) |
+| 6 | Workloads: enforcement, forge-resistance, admin-bypass, reboot durability. Flip the knob. | Authz live (opt-in) |
 
 ### 4.2 Knobs
 | Knob | Default | Purpose |
@@ -273,7 +308,7 @@ seeded failure-injection surface. **No real OpenSSL handshake in sim.**
 | `AUTHZ_ENFORCEMENT_ENABLED` | `false` | Master switch; off → allow. |
 | `AUTHZ_INITIAL_ADMIN_CN` | `""` | Cluster-internal/admin identity (cert CN); cluster/backup/DR present this — CN-equality bypass. |
 | `AUTHZ_MAX_IDENTITIES` | `32` | Cap on distinct policy identities. |
-| sim handshake-slot count / failure-rate | (sim) | Models handshake-resource exhaustion + injects TLS failures. |
+| sim handshake failure-rate | (sim) | Injects TLS handshake failures. |
 
 ### 4.3 Critical files
 - Read enforcement / persistence / SS apply: `fdbserver/storageserver/storageserver.actor.cpp`
@@ -306,8 +341,8 @@ seeded failure-injection surface. **No real OpenSSL handshake in sim.**
 2. `just sim run tests/fast/AuthzKeyRange.toml` — enforcement allow/deny; **zero `SevError`**.
 3. Forge-resistance seed: a process presenting an un-issued identity → handshake fails / denied.
 4. Admin seed: admin-CN bypass vs layer-CN enforced.
-5. Reboot-under-exhaustion seed: `forceSSL` + reduced handshake slots + cluster reboot → recovers,
-   enforcement correct, no fail-open, policy restored from `persistAuthzPolicyKeys`.
+5. Reboot seed: `forceSSL` + cluster reboot → recovers, enforcement correct, no fail-open,
+   policy restored from `persistAuthzPolicyKeys`.
 6. Cap: a 33rd identity is rejected; subspace: a non-admin write to `\xff/authz/*` is denied.
 7. Real-side contract: `AuthzTlsTest` asserts `identity == issued CN` and rejects a forged cert.
 8. Re-run several seeds (deterministic with `forceSSL`).
@@ -319,10 +354,9 @@ seeded failure-injection surface. **No real OpenSSL handshake in sim.**
 |---|---|---|
 | 1 | `ApplyMetadataMutation`/`applyPrivateData` are recovery-critical, wide recompile blast radius | Copy proven tenant handlers; gate behind the enforcement knob; narrow headers |
 | 2 | Mapped reads (`getMappedKeyValuesQ`) bypass per-handler checks | First cut denies non-admin mapped reads; per-subrange checks as follow-up |
-| 3 | TLS-handshake exhaustion on reboot worsened by the feature | Policy rides the existing log stream — no new connections; modeled + tested as a sim scenario |
-| 4 | Sim fake diverges from real TLS | `AuthzTlsTest` (real OpenSSL) is the contract the fake is checked against |
-| 5 | Single admin CN coarse (any server = any identity) | Accepted for v2 (out of threat model); per-role admin via distributed `\xff/authz/admin/<cn>` deferred |
-| 6 | Client `\xff` reads under a non-admin identity | Grant single-key R, or document; system keyspace is admin-only |
+| 3 | Sim fake diverges from real TLS | `AuthzTlsTest` (real OpenSSL) is the contract the fake is checked against |
+| 4 | Single admin CN coarse (any server = any identity) | Accepted for v2 (out of threat model); per-role admin via distributed `\xff/authz/admin/<cn>` deferred |
+| 5 | Client `\xff` reads under a non-admin identity | Grant single-key R, or document; system keyspace is admin-only |
 
 ---
 
