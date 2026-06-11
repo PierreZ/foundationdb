@@ -159,6 +159,8 @@ bool canReplyWith(Error e) {
 	case error_code_key_not_tuple:
 	case error_code_value_not_tuple:
 	case error_code_mapper_not_tuple:
+	// Per-identity key-range authz denial (POC; src/design/key-range-authz-v2.md) — final, not retried.
+	case error_code_permission_denied:
 		// case error_code_all_alternatives_failed:
 		return true;
 	default:
@@ -230,6 +232,12 @@ static const KeyRangeRef persistBulkLoadTaskKeys =
 // Accumulative checksum related prefix
 static const KeyRangeRef persistAccumulativeChecksumKeys =
     KeyRangeRef(PERSIST_PREFIX "AccumulativeChecksum/"_sr, PERSIST_PREFIX "AccumulativeChecksum0"_sr);
+
+// Per-identity key-range authz policy rows, one per identity (POC; src/design/key-range-authz-v2.md
+// §2.6). Persisted in applyPrivateData and restored in restoreDurableState, so the policy map
+// survives an SS reboot (tenant persistTenantMapKeys analog).
+static const KeyRangeRef persistAuthzPolicyKeys =
+    KeyRangeRef(PERSIST_PREFIX "AuthzPolicy/"_sr, PERSIST_PREFIX "AuthzPolicy0"_sr);
 
 inline Key encodePersistAccumulativeChecksumKey(uint16_t acsIndex) {
 	BinaryWriter wr(Unversioned());
@@ -2181,12 +2189,6 @@ Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 	// Temporarily disabled -- this path is hit a lot
 	// getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.first();
 
-	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
-	if (!ssAuthzCheck(data, "getValue", req.peerIdentity(), req.key, keyAfter(req.key), authz::Perm::R)) {
-		req.reply.sendError(permission_denied());
-		co_return;
-	}
-
 	try {
 		++data->counters.getValueQueries;
 		++data->counters.allQueries;
@@ -2216,6 +2218,14 @@ Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 		Version version = co_await waitForVersion(data, commitVersion, req.version, req.spanContext);
 		data->counters.readLatencySamples.sample(
 		    g_network->timer() - queueWaitEnd, ReadLatencySamples::READ_VERSION_WAIT, trackedReadType(req));
+
+		// Per-identity key-range authz check (POC; src/design/key-range-authz-v2.md §2.3). Runs AFTER
+		// waitForVersion so the map reflects every policy mutation ≤ the read version — checking at
+		// handler entry would consult a stale (possibly empty, e.g. just-rebooted, still-replaying)
+		// map and wrongly deny (sim seed 1035).
+		if (!ssAuthzCheck(data, "getValue", req.peerIdentity(), req.key, keyAfter(req.key), authz::Perm::R)) {
+			throw permission_denied();
+		}
 
 		if (req.options.present() && req.options.get().debugID.present())
 			g_traceBatch.addEvent("GetValueDebug",
@@ -3357,14 +3367,6 @@ Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 	Span span("SS:getKeyValues"_loc, req.spanContext);
 	int64_t resultSize = 0;
 
-	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
-	// Single check covering the requested key range; mixed-permission denials surface a generic
-	// permission_denied so the boundary key is not revealed.
-	if (!ssAuthzCheck(data, "getKeyValues", req.peerIdentity(), req.begin.getKey(), req.end.getKey(), authz::Perm::R)) {
-		req.reply.sendError(permission_denied());
-		co_return;
-	}
-
 	getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.traceID;
 
 	++data->counters.getRangeQueries;
@@ -3437,6 +3439,16 @@ Future<Void> getKeyValuesQ(StorageServer* data, GetKeyValuesRequest req)
 		                       : findKey(data, req.end, version, shard, &offset2, span.context, req.options);
 		Key begin = co_await fBegin;
 		Key end = co_await fEnd;
+
+		// Per-identity key-range authz check (POC; src/design/key-range-authz-v2.md §2.3). Runs AFTER
+		// waitForVersion (the map reflects every policy mutation ≤ the read version — a stale map
+		// would wrongly deny on a just-rebooted, still-replaying SS; sim seed 1035) and AFTER findKey
+		// (the check covers the RESOLVED range actually read, so a KeySelector offset cannot probe
+		// outside the granted range). An empty resolved range reads nothing — nothing to authorize.
+		// Mixed-permission denials surface one generic permission_denied (no boundary-key leak).
+		if (begin < end && !ssAuthzCheck(data, "getKeyValues", req.peerIdentity(), begin, end, authz::Perm::R)) {
+			throw permission_denied();
+		}
 
 		if (req.options.present() && req.options.get().debugID.present())
 			g_traceBatch.addEvent(
@@ -6045,13 +6057,6 @@ Future<Void> getKeyQ(StorageServer* data, GetKeyRequest req) {
 	Span span("SS:getKey"_loc, req.spanContext);
 	int64_t resultSize = 0;
 
-	// Per-identity key-range authorization check (POC; src/design/key-range-authz-v1.md).
-	if (!ssAuthzCheck(
-	        data, "getKey", req.peerIdentity(), req.sel.getKey(), keyAfter(req.sel.getKey()), authz::Perm::R)) {
-		req.reply.sendError(permission_denied());
-		co_return;
-	}
-
 	getCurrentLineage()->modify(&TransactionLineage::txID) = req.spanContext.traceID;
 
 	++data->counters.getKeyQueries;
@@ -6081,6 +6086,14 @@ Future<Void> getKeyQ(StorageServer* data, GetKeyRequest req) {
 
 		int offset{ 0 };
 		Key absoluteKey = co_await findKey(data, req.sel, version, shard, &offset, req.spanContext, req.options);
+
+		// Per-identity key-range authz check (POC; src/design/key-range-authz-v2.md §2.3). Runs AFTER
+		// waitForVersion (fresh map — a just-rebooted, still-replaying SS must not deny from a stale
+		// map; sim seed 1035) and AFTER findKey (the check covers the RESOLVED key the selector
+		// landed on, so an offset cannot probe outside the granted range).
+		if (!ssAuthzCheck(data, "getKey", req.peerIdentity(), absoluteKey, keyAfter(absoluteKey), authz::Perm::R)) {
+			throw permission_denied();
+		}
 
 		data->checkChangeCounter(changeCounter,
 		                         KeyRangeRef(std::min<KeyRef>(req.sel.getKey(), absoluteKey),
@@ -9569,6 +9582,13 @@ private:
 				    .detail("Version", ver)
 				    .detail("MapSize", data->authzPolicyMap.size());
 				data->authzPolicyMap[identity] = std::move(entry);
+				// Persist the row so the map survives an SS reboot (restored in restoreDurableState).
+				auto& mLV = data->addVersionToMutationLog(data->data().getLatestVersion());
+				data->addMutationToMutationLog(
+				    mLV,
+				    MutationRef(MutationRef::SetValue,
+				                StringRef(identity).withPrefix(persistAuthzPolicyKeys.begin, mLV.arena()),
+				                m.param2));
 			} else {
 				// Revoke: clear over the privatized [param1, param2) policy range.
 				KeyRef beginPub = m.param1.substr(1);
@@ -9588,6 +9608,17 @@ private:
 				    .detail("End", endPub)
 				    .detail("Cleared", cleared)
 				    .detail("Version", ver);
+				// Persist the clear over the matching slice of persistAuthzPolicyKeys. The proxy clamps
+				// the broadcast range to authzPolicyKeys, so begin always carries the prefix; end may be
+				// authzPolicyKeys.end itself (== prefix with '/'→'0'), which maps to the persist range end.
+				auto& mLV = data->addVersionToMutationLog(data->data().getLatestVersion());
+				StringRef persistBegin =
+				    beginPub.removePrefix(authzPolicyPrefix).withPrefix(persistAuthzPolicyKeys.begin, mLV.arena());
+				StringRef persistEnd = endPub.startsWith(authzPolicyPrefix)
+				                           ? endPub.removePrefix(authzPolicyPrefix)
+				                                 .withPrefix(persistAuthzPolicyKeys.begin, mLV.arena())
+				                           : persistAuthzPolicyKeys.end;
+				data->addMutationToMutationLog(mLV, MutationRef(MutationRef::ClearRange, persistBegin, persistEnd));
 			}
 		} else {
 			ASSERT(false); // Unknown private mutation
@@ -11126,6 +11157,7 @@ Future<bool> restoreDurableState(StorageServer* data, IKeyValueStore* storage) {
 	Future<RangeResult> fStorageShards = storage->readRange(persistStorageServerShardKeys);
 	Future<RangeResult> fAccumulativeChecksum = storage->readRange(persistAccumulativeChecksumKeys);
 	Future<RangeResult> fBulkLoadTask = storage->readRange(persistBulkLoadTaskKeys);
+	Future<RangeResult> fAuthzPolicy = storage->readRange(persistAuthzPolicyKeys);
 
 	Promise<Void> byteSampleSampleRecovered;
 	Promise<Void> startByteSampleRestore;
@@ -11138,7 +11170,7 @@ Future<bool> restoreDurableState(StorageServer* data, IKeyValueStore* storage) {
 	co_await waitForAll(pointFutures);
 	std::vector<Future<RangeResult>> rangeFutures = { fShardAssigned,        fShardAvailable, fPendingCheckpoints,
 		                                              fCheckpoints,          fMoveInShards,   fStorageShards,
-		                                              fAccumulativeChecksum, fBulkLoadTask };
+		                                              fAccumulativeChecksum, fBulkLoadTask,   fAuthzPolicy };
 	co_await waitForAll(rangeFutures);
 	co_await byteSampleSampleRecovered.getFuture();
 	TraceEvent("RestoringDurableState", data->thisServerID).log();
@@ -11249,6 +11281,21 @@ Future<bool> restoreDurableState(StorageServer* data, IKeyValueStore* storage) {
 			ASSERT(acsIndex == acsState.acsIndex);
 			data->acsValidator->restore(acsState, data->thisServerID, data->tag, data->version.get());
 		}
+	}
+
+	// Restore the per-identity authz policy map (POC; src/design/key-range-authz-v2.md §2.6) before
+	// the SS serves reads. The log cursor resumes from durableVersion+1, so without this an SS reboot
+	// would come up with an empty map and (under enforcement) wrongly deny everything.
+	RangeResult authzPolicyRows = fAuthzPolicy.get();
+	data->bytesRestored += authzPolicyRows.logicalSize();
+	for (int authzLoc = 0; authzLoc < authzPolicyRows.size(); authzLoc++) {
+		std::string identity = authzPolicyRows[authzLoc].key.removePrefix(persistAuthzPolicyKeys.begin).toString();
+		authz::PolicyEntry entry = authz::PolicyEntry::decode(authzPolicyRows[authzLoc].value);
+		TraceEvent(SevInfo, "AuthzPolicyRestored", data->thisServerID)
+		    .detail("Identity", identity)
+		    .detail("Grants", entry.grants.size());
+		data->authzPolicyMap[identity] = std::move(entry);
+		co_await yield();
 	}
 
 	KeyRangeMap<Optional<UID>> bulkLoadTaskRangeMap; // store dataMoveId on ranges with active bulkload tasks
@@ -12466,6 +12513,50 @@ Future<Void> storageInterfaceRegistration(StorageServer* self,
 	}
 }
 
+// One-shot population of the authz policy map for a freshly recruited SS (POC;
+// src/design/key-range-authz-v2.md §2.6 addendum). Its tag only receives policy broadcasts from its
+// registration version on, so policies written before it existed would never reach it. Read the
+// current policy once at recruitment (the deleted tenant map's initTenantMap analog); the
+// metadata-mutation broadcast keeps the map current from here, and applyPrivateData persists rows
+// for reboots. The SS presents its own (admin) identity, so this read passes enforcement.
+Future<Void> initAuthzPolicyMap(StorageServer* self) {
+	if (!SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED) {
+		co_return; // map is unused without enforcement; don't add a read to every recruitment
+	}
+	Transaction tr(self->cx);
+	while (true) {
+		Error err;
+		try {
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			RangeResult rows = co_await tr.getRange(authzPolicyKeys, SERVER_KNOBS->AUTHZ_MAX_IDENTITIES + 1);
+			if (rows.more) {
+				TraceEvent(SevWarnAlways, "AuthzPolicyInitTruncated", self->thisServerID)
+				    .detail("Rows", rows.size());
+			}
+			for (auto const& kv : rows) {
+				std::string identity = kv.key.removePrefix(authzPolicyPrefix).toString();
+				self->authzPolicyMap[identity] = authz::PolicyEntry::decode(kv.value);
+				// Persist immediately: the caller commits right after (makeNewStorageServerDurable),
+				// so a later reboot restores these rows. Without this, a fresh-recruited SS that
+				// reboots comes back with an EMPTY map and wrongly denies granted identities until
+				// the next policy broadcast (the deleted tenant map's initTenantMap had this hole —
+				// found by sim seed 1035).
+				self->storage.writeKeyValue(
+				    KeyValueRef(kv.key.removePrefix(authzPolicyPrefix).withPrefix(persistAuthzPolicyKeys.begin),
+				                kv.value));
+			}
+			TraceEvent(SevInfo, "AuthzPolicyInitialized", self->thisServerID)
+			    .detail("Identities", rows.size());
+			co_return;
+		} catch (Error& e) {
+			err = e;
+		}
+		co_await tr.onError(err);
+	}
+}
+
 Future<Void> rocksdbLogCleaner(std::string folder) {
 	std::replace(folder.begin(), folder.end(), '/', '_');
 	if (!folder.empty() && folder[0] == '_') {
@@ -12566,6 +12657,9 @@ Future<Void> storageServer(IKeyValueStore* persistentData,
 				    .detail("EngineType", self.storage.getKeyValueStoreType().toString())
 				    // This is an intentionally useless detail to avoid renumbering things.
 				    .detail("Step", "9.SomeLinesOfCodeExecuted");
+
+				// Policies written before this SS existed never reach its (brand-new) tag; fetch them once.
+				co_await initAuthzPolicyMap(&self);
 			} else {
 				self.tag = seedTag;
 			}
