@@ -1,14 +1,17 @@
-# POC end-to-end check for per-identity key-range authorization (v1).
-# See src/design/key-range-authz-v1.md.
+# POC end-to-end check for per-identity key-range authorization (v2).
+# See src/design/key-range-authz-v2.md (incl. addendum).
 #
 # What this exercises:
 #   - Policy written to \xff/authz/policy/<identity>, recognized as a metadata mutation at the
 #     CommitProxy and broadcast (privatized) to every StorageServer, applied in version order.
 #   - CommitProxy + StorageServer enforcement gated by AUTHZ_ENFORCEMENT_ENABLED.
-#   - Cluster-internal traffic authenticates via the admin cert (AUTHZ_INITIAL_ADMIN_CN); a layer
-#     client presents a different identity and is enforced.
-#   - Real X509 cert (mkcert::makeSelfSignedCertWithCN) minted per simulated process; CN extracted
-#     via the same OpenSSL parser the production SSLConnection uses.
+#   - Cluster-internal traffic presents the admin identity (AUTHZ_INITIAL_ADMIN_CN); a layer client
+#     is issued a different identity (write-once, sim trust model) and is enforced.
+#   - AUTHZ_MAX_IDENTITIES cap (sim-randomized 4..32): grants adapt to the cap, the map is filled to
+#     exactly the cap, and the (cap+1)'th identity must be rejected (authz_too_many_identities).
+#   - SS reboot durability: the auto-injected failure workloads (Attrition machine kills/reboots,
+#     RandomMoveKeys) run concurrently; a rebooted SS restores its policy map from
+#     persistAuthzPolicyKeys and enforcement must stay correct for every op after it.
 
 [configuration]
 # Pin TLS on for every run. The simulator otherwise rolls sslEnabled at 10%, which would
@@ -21,12 +24,8 @@ authz_initial_admin_cn = "test-admin"
 
 [[test]]
 testTitle = "AuthzKeyRange"
-# Disable the auto-injected failure workloads (Attrition, RandomMoveKeys). They run concurrently on
-# the same tester process and commit system keys, which collides with this workload temporarily
-# switching its process identity to a non-admin CN to exercise enforcement. POC scope.
-runFailureWorkloads = false
 # Disable the post-test ConsistencyCheck workload + after-test consistency scan. These run on the
-# tester processes, which now permanently present a non-admin "client-<i>" identity (one fixed cert
+# tester processes, which permanently present a non-admin "client-<i>" identity (one fixed cert
 # per client, for life). A full-keyspace consistency scan is an ops/admin operation — not something a
 # layer client may do — so under enforcement it is (correctly) denied on \xff/serverList etc. In a real
 # deployment that scan runs as the ConsistencyScan role on server processes under the admin identity.
