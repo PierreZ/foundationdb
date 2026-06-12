@@ -93,10 +93,18 @@ struct ResolverData {
 	Version popVersion = 0; // exclusive, usually set to commitVersion + 1
 	std::map<UID, Reference<StorageInfo>>* storageCache = nullptr;
 	std::unordered_map<UID, StorageServerInterface>* tssMapping = nullptr;
+	// Per-identity key-range authz policy map maintained on this resolver (POC; key-range-authz-v2.md).
+	// Needed so the resolver makes the same identity-cap drop decision as every commit proxy.
+	std::map<std::string, authz::PolicyEntry>* authzPolicyMap = nullptr;
 
 	// For initial broadcast
-	ResolverData(UID debugId, IKeyValueStore* store, KeyRangeMap<ServerCacheInfo>* info, bool& forceRecovery)
-	  : dbgid(debugId), txnStateStore(store), keyInfo(info), confChanges(forceRecovery), initialCommit(true) {}
+	ResolverData(UID debugId,
+	             IKeyValueStore* store,
+	             KeyRangeMap<ServerCacheInfo>* info,
+	             bool& forceRecovery,
+	             std::map<std::string, authz::PolicyEntry>* authzPolicyMap = nullptr)
+	  : dbgid(debugId), txnStateStore(store), keyInfo(info), confChanges(forceRecovery), initialCommit(true),
+	    authzPolicyMap(authzPolicyMap) {}
 
 	// For transaction batches that contain metadata mutations
 	ResolverData(UID debugId,
@@ -107,10 +115,11 @@ struct ResolverData {
 	             bool& forceRecovery,
 	             Version popVersion,
 	             std::map<UID, Reference<StorageInfo>>* storageCache,
-	             std::unordered_map<UID, StorageServerInterface>* tssMapping)
+	             std::unordered_map<UID, StorageServerInterface>* tssMapping,
+	             std::map<std::string, authz::PolicyEntry>* authzPolicyMap = nullptr)
 	  : dbgid(debugId), txnStateStore(store), keyInfo(info), confChanges(forceRecovery),
 	    logSystemConsumer(logSystemConsumer), toCommit(toCommit), popVersion(popVersion), storageCache(storageCache),
-	    tssMapping(tssMapping) {}
+	    tssMapping(tssMapping), authzPolicyMap(authzPolicyMap) {}
 };
 
 inline bool isMetadataMutation(MutationRef const& m) {
@@ -130,6 +139,19 @@ inline bool isMetadataMutation(MutationRef const& m) {
 Reference<StorageInfo> getStorageInfo(UID id,
                                       std::map<UID, Reference<StorageInfo>>* storageCache,
                                       IKeyValueStore* txnStateStore);
+
+// Per-identity key-range authz (POC; key-range-authz-v2.md): would applying this transaction's
+// \xff/authz/policy/ sets push the number of distinct identities past maxIdentities? The SAME rule
+// must be evaluated by the commit proxy that owns the batch (to reject the txn with
+// authz_too_many_identities) and by every metadata applier (other proxies via the resolver's
+// forwarded state transactions, the resolver itself) so all txnStateStores make identical
+// accept/drop decisions in version order. On accept, the txn's new identities are merged into
+// batchNewIdentities (the proxy pre-pass scans a whole batch against a not-yet-updated map; pass a
+// fresh set per txn when the map advances between calls).
+bool authzTxnExceedsIdentityCap(const std::map<std::string, authz::PolicyEntry>& policyMap,
+                                const VectorRef<MutationRef>& mutations,
+                                int maxIdentities,
+                                std::set<std::string>& batchNewIdentities);
 
 void applyMetadataMutations(SpanContext const& spanContext,
                             const ApplyMetadataProxyContext& proxyMetadata,

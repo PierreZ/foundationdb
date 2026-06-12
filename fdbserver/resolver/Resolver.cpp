@@ -152,6 +152,10 @@ struct Resolver : ReferenceCounted<Resolver> {
 	std::map<UID, Reference<StorageInfo>> storageCache;
 	KeyRangeMap<ServerCacheInfo> keyInfo; // keyrange -> all storage servers in all DCs for the keyrange
 	std::unordered_map<UID, StorageServerInterface> tssMapping;
+	// Per-identity key-range authz policy map (POC; key-range-authz-v2.md), maintained in version
+	// order from \xff/authz/policy/* metadata mutations so the resolver makes the same identity-cap
+	// drop decision as the commit proxies. Seeded by the TxnStateRequest replay at recovery.
+	std::map<std::string, authz::PolicyEntry> authzPolicyMap;
 	bool forceRecovery = false;
 
 	Version debugMinRecentStateVersion = 0;
@@ -396,7 +400,8 @@ Future<Void> resolveBatch(Reference<Resolver> self, ResolveTransactionBatchReque
 				                                    self->forceRecovery,
 				                                    req.version + 1,
 				                                    &self->storageCache,
-				                                    &self->tssMapping));
+				                                    &self->tssMapping,
+				                                    &self->authzPolicyMap));
 			}
 		}
 		for (int t : req.txnStateTransactions) {
@@ -693,8 +698,11 @@ Future<Void> processCompleteTransactionStateRequest(TransactionStateResolveConte
 		pContext->pResolverData->keyInfo.rawInsert(keyInfoData);
 
 		bool confChanges; // Ignore configuration changes for initial commits.
-		ResolverData resolverData(
-		    pContext->pResolverData->dbgid, pContext->pTxnStateStore, &pContext->pResolverData->keyInfo, confChanges);
+		ResolverData resolverData(pContext->pResolverData->dbgid,
+		                          pContext->pTxnStateStore,
+		                          &pContext->pResolverData->keyInfo,
+		                          confChanges,
+		                          &pContext->pResolverData->authzPolicyMap);
 		applyMetadataMutations(SpanContext(), resolverData, mutations);
 	}
 

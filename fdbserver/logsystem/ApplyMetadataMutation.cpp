@@ -47,6 +47,30 @@ Reference<StorageInfo> getStorageInfo(UID id,
 	}
 	return storageInfo;
 }
+
+bool authzTxnExceedsIdentityCap(const std::map<std::string, authz::PolicyEntry>& policyMap,
+                                const VectorRef<MutationRef>& mutations,
+                                int maxIdentities,
+                                std::set<std::string>& batchNewIdentities) {
+	std::set<std::string> txnNewIdentities;
+	for (auto const& m : mutations) {
+		if (m.type == MutationRef::SetValue && m.param1.startsWith(authzPolicyPrefix)) {
+			std::string identity = m.param1.removePrefix(authzPolicyPrefix).toString();
+			if (!policyMap.count(identity) && !batchNewIdentities.count(identity)) {
+				txnNewIdentities.insert(identity);
+			}
+		}
+	}
+	if (txnNewIdentities.empty()) {
+		return false;
+	}
+	if (policyMap.size() + batchNewIdentities.size() + txnNewIdentities.size() > (size_t)maxIdentities) {
+		return true;
+	}
+	batchNewIdentities.insert(txnNewIdentities.begin(), txnNewIdentities.end());
+	return false;
+}
+
 namespace {
 
 // It is incredibly important that any modifications to txnStateStore are done in such a way that the same operations
@@ -97,7 +121,7 @@ public:
 	    txnStateStore(resolverData_.txnStateStore), toCommit(resolverData_.toCommit),
 	    confChange(resolverData_.confChanges), logSystemConsumer(resolverData_.logSystemConsumer),
 	    popVersion(resolverData_.popVersion), keyInfo(resolverData_.keyInfo), storageCache(resolverData_.storageCache),
-	    initialCommit(resolverData_.initialCommit), forResolver(true),
+	    authzPolicyMap(resolverData_.authzPolicyMap), initialCommit(resolverData_.initialCommit), forResolver(true),
 	    accumulativeChecksumIndex(resolverAccumulativeChecksumIndex), epoch(Optional<LogEpoch>()) {}
 
 private:
@@ -1198,6 +1222,28 @@ private:
 
 public:
 	void apply() {
+		// Per-identity key-range authz (POC; key-range-authz-v2.md): the identity-cap decision must
+		// be identical on every metadata applier — the proxy that owns the batch, every other proxy
+		// (which applies state transactions forwarded by the resolver, gated only on the RESOLVER's
+		// commit verdict), and the resolver itself when PROXY_USE_RESOLVER_PRIVATE_MUTATIONS is on.
+		// A transaction whose policy sets would exceed the cap is therefore dropped wholesale here,
+		// deterministically in version order; the owner proxy makes the same decision pre-apply
+		// (applyMetadataToCommittedTransactions) and sends authz_too_many_identities to the client.
+		// Rejecting only at the owner proxy diverges the txnStateStores and corrupts recovery
+		// (Joshua seed 2032453810). Recovery replay (initialCommit) restores whatever is durable.
+		if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED && !initialCommit && authzPolicyMap != nullptr) {
+			std::set<std::string> newIdentities;
+			if (authzTxnExceedsIdentityCap(
+			        *authzPolicyMap, mutations, SERVER_KNOBS->AUTHZ_MAX_IDENTITIES, newIdentities)) {
+				CODE_PROBE(true, "authz identity cap dropped txn metadata at apply");
+				TraceEvent(SevInfo, "AuthzIdentityCapDropTxn", dbgid)
+				    .suppressFor(1.0)
+				    .detail("ExistingIdentities", authzPolicyMap->size())
+				    .detail("MaxIdentities", SERVER_KNOBS->AUTHZ_MAX_IDENTITIES)
+				    .detail("ForResolver", forResolver);
+				return;
+			}
+		}
 		for (auto const& m : mutations) {
 			if (toCommit) {
 				toCommit->addTransactionInfo(spanContext);

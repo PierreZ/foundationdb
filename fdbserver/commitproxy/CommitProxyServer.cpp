@@ -506,6 +506,11 @@ struct CommitBatchContext {
 	bool forceRecovery = false;
 	bool rejected = false; // If rejected due to long queue length
 
+	// Indices of txns denied by the authz write ACL pre-resolution (POC; key-range-authz-v2.md).
+	// They were answered (permission_denied) and neutered there; postResolution marks them
+	// LockReject so no later stage treats them as committed.
+	std::vector<int> authzRejectedTxns;
+
 	int64_t localBatchNumber;
 	LogPushData toCommit;
 
@@ -841,6 +846,59 @@ Future<Void> preresolutionProcessing(CommitBatchContext* self) {
 		co_return;
 	}
 
+	// Per-identity key-range authorization (POC; src/design/key-range-authz-v2.md): enforce write
+	// ACLs BEFORE resolution. A rejection after resolution diverges the txnStateStores: the
+	// resolver forwards every state transaction it judged committed to all other commit proxies,
+	// so a txn this proxy refuses to apply would still be applied everywhere else (the corruption
+	// behind Joshua seed 2032453810). Denied txns are answered now and neutered — mutations and
+	// conflict ranges cleared — so resolvers see a no-op and never record them as committed state
+	// transactions; postResolution marks them LockReject so the reply loop skips them.
+	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED) {
+		std::string const& adminCN = SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN;
+		for (int t = 0; t < trs.size(); t++) {
+			CommitTransactionRequest& tr = trs[t];
+			bool rejectedByACL = false;
+			KeyRef deniedKey;
+			for (auto const& m : tr.transaction.mutations) {
+				bool ok;
+				if (m.type == MutationRef::ClearRange) {
+					ok = authz::checkAuthorized(pProxyCommitData->authzPolicyMap,
+					                            adminCN,
+					                            tr.peerIdentity(),
+					                            m.param1,
+					                            m.param2,
+					                            authz::Perm::W);
+				} else {
+					ok = authz::checkAuthorized(
+					    pProxyCommitData->authzPolicyMap, adminCN, tr.peerIdentity(), m.param1, authz::Perm::W);
+				}
+				if (!ok) {
+					rejectedByACL = true;
+					deniedKey = m.param1;
+					break;
+				}
+			}
+			// Observability (POC): log denials always, and commits by non-admin (layer) identities;
+			// admin commits (cluster-internal traffic) are suppressed to avoid flooding the trace.
+			bool isAdmin = !adminCN.empty() && tr.peerIdentity() == adminCN;
+			if (rejectedByACL || !isAdmin) {
+				TraceEvent(SevInfo, "AuthzCommitCheck", pProxyCommitData->dbgid)
+				    .detail("Identity", tr.peerIdentity())
+				    .detail("Mutations", tr.transaction.mutations.size())
+				    .detail("Decision", rejectedByACL ? "deny" : "allow")
+				    .detail("DeniedKey", rejectedByACL ? deniedKey : ""_sr)
+				    .detail("PolicyRows", pProxyCommitData->authzPolicyMap.size());
+			}
+			if (rejectedByACL) {
+				tr.reply.sendError(permission_denied());
+				tr.transaction.mutations = VectorRef<MutationRef>();
+				tr.transaction.read_conflict_ranges = VectorRef<KeyRangeRef>();
+				tr.transaction.write_conflict_ranges = VectorRef<KeyRangeRef>();
+				self->authzRejectedTxns.push_back(t);
+			}
+		}
+	}
+
 	self->releaseDelay = delay(computeReleaseDelay(self, latencyBucket), TaskPriority::ProxyMasterVersionReply);
 
 	if (debugID.present()) {
@@ -1152,45 +1210,42 @@ Future<Void> applyMetadataToCommittedTransactions(CommitBatchContext* self) {
 	ProxyCommitData* const pProxyCommitData = self->pProxyCommitData;
 	auto& trs = self->trs;
 
-	// Per-identity key-range authz (POC; src/design/key-range-authz-v2.md addendum): cap the number
-	// of distinct policy identities at AUTHZ_MAX_IDENTITIES. This MUST run before the
-	// applyMetadataMutations loop below — by the assign-stage pre-pass the batch's metadata has
-	// already been applied to the proxy map, the txnStateStore and the broadcast stream, so a later
-	// rejection could not undo the row. Updates to existing identities and clears always pass.
-	// Recovery replay (initialCommit) never runs this function, so saved rows always restore.
+	// Per-identity key-range authz (POC; src/design/key-range-authz-v2.md addendum).
 	if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED) {
+		// Txns denied by the write ACL were answered and neutered pre-resolution
+		// (preresolutionProcessing); mark them so the reply loop ("error already sent") and every
+		// later stage skip them.
+		for (int t : self->authzRejectedTxns) {
+			self->committed[t] = ConflictBatchStatus::TransactionLockReject;
+		}
+
+		// Cap the number of distinct policy identities at AUTHZ_MAX_IDENTITIES. The decision is the
+		// shared authzTxnExceedsIdentityCap rule, which ApplyMetadataMutationsImpl::apply() also
+		// evaluates on every metadata applier — other proxies and the resolver apply this batch's
+		// state txns based on the RESOLVER's commit verdict and never see this rejection, so the two
+		// sides must agree or the txnStateStores diverge and recovery is corrupted (Joshua seed
+		// 2032453810). Here the owner additionally rejects the client's txn: error reply + skip its
+		// metadata and raw mutations. Updates to existing identities and clears always pass.
+		// Recovery replay (initialCommit) never runs this function, so saved rows always restore.
 		std::set<std::string> batchNewIdentities; // new identities accepted earlier in this batch
 		for (int t = 0; t < trs.size(); t++) {
 			if (!(self->committed[t] == ConflictBatchStatus::TransactionCommitted &&
 			      (!self->locked || trs[t].isLockAware()))) {
 				continue;
 			}
-			std::set<std::string> txnNewIdentities;
-			for (auto const& m : trs[t].transaction.mutations) {
-				if (m.type == MutationRef::SetValue && m.param1.startsWith(authzPolicyPrefix)) {
-					std::string identity = m.param1.removePrefix(authzPolicyPrefix).toString();
-					if (!pProxyCommitData->authzPolicyMap.count(identity) && !batchNewIdentities.count(identity)) {
-						txnNewIdentities.insert(identity);
-					}
-				}
-			}
-			if (txnNewIdentities.empty()) {
-				continue;
-			}
-			if (pProxyCommitData->authzPolicyMap.size() + batchNewIdentities.size() + txnNewIdentities.size() >
-			    (size_t)SERVER_KNOBS->AUTHZ_MAX_IDENTITIES) {
+			if (authzTxnExceedsIdentityCap(pProxyCommitData->authzPolicyMap,
+			                               trs[t].transaction.mutations,
+			                               SERVER_KNOBS->AUTHZ_MAX_IDENTITIES,
+			                               batchNewIdentities)) {
 				TraceEvent(SevWarn, "AuthzIdentityCapExceeded", pProxyCommitData->dbgid)
 				    .suppressFor(1.0)
 				    .detail("Identity", trs[t].peerIdentity())
 				    .detail("ExistingIdentities", pProxyCommitData->authzPolicyMap.size())
 				    .detail("NewInBatch", batchNewIdentities.size())
-				    .detail("NewInTxn", txnNewIdentities.size())
 				    .detail("MaxIdentities", SERVER_KNOBS->AUTHZ_MAX_IDENTITIES);
 				trs[t].reply.sendError(authz_too_many_identities());
 				// LockReject (not Conflict): the reply loop treats LockReject as "error already sent".
 				self->committed[t] = ConflictBatchStatus::TransactionLockReject;
-			} else {
-				batchNewIdentities.insert(txnNewIdentities.begin(), txnNewIdentities.end());
 			}
 		}
 	}
@@ -1379,54 +1434,6 @@ Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 		if (!(self->committed[self->transactionNum] == ConflictBatchStatus::TransactionCommitted &&
 		      (!self->locked || trs[self->transactionNum].isLockAware()))) {
 			continue;
-		}
-
-		// Per-identity key-range authorization (POC; src/design/key-range-authz-v1.md).
-		// Pre-pass: if any mutation in this txn is denied by the (broadcast-maintained) policy map,
-		// reject the whole txn. Mirrors the transaction_too_old per-txn rejection (~line 836).
-		if (SERVER_KNOBS->AUTHZ_ENFORCEMENT_ENABLED) {
-			CommitTransactionRequest& tr = trs[self->transactionNum];
-			std::string const& adminCN = SERVER_KNOBS->AUTHZ_INITIAL_ADMIN_CN;
-			bool rejectedByACL = false;
-			KeyRef deniedKey;
-			for (auto const& m : tr.transaction.mutations) {
-				bool ok;
-				if (m.type == MutationRef::ClearRange) {
-					ok = authz::checkAuthorized(pProxyCommitData->authzPolicyMap,
-					                            adminCN,
-					                            tr.peerIdentity(),
-					                            m.param1,
-					                            m.param2,
-					                            authz::Perm::W);
-				} else {
-					ok = authz::checkAuthorized(
-					    pProxyCommitData->authzPolicyMap, adminCN, tr.peerIdentity(), m.param1, authz::Perm::W);
-				}
-				if (!ok) {
-					rejectedByACL = true;
-					deniedKey = m.param1;
-					break;
-				}
-			}
-			// Observability (POC): log denials always, and commits by non-admin (layer) identities;
-			// admin commits (cluster-internal traffic) are suppressed to avoid flooding the trace.
-			bool isAdmin = !adminCN.empty() && tr.peerIdentity() == adminCN;
-			if (rejectedByACL || !isAdmin) {
-				TraceEvent(SevInfo, "AuthzCommitCheck", pProxyCommitData->dbgid)
-				    .detail("Identity", tr.peerIdentity())
-				    .detail("Mutations", tr.transaction.mutations.size())
-				    .detail("Decision", rejectedByACL ? "deny" : "allow")
-				    .detail("DeniedKey", rejectedByACL ? deniedKey : ""_sr)
-				    .detail("PolicyRows", pProxyCommitData->authzPolicyMap.size());
-			}
-			if (rejectedByACL) {
-				tr.reply.sendError(permission_denied());
-				// Mark as LockReject, not Conflict: the reply loop treats LockReject as "error already
-				// sent" and skips it, whereas Conflict would send a second (not_committed) reply to the
-				// already-set promise and trip the canBeSet() assertion in SAV::sendError.
-				self->committed[self->transactionNum] = ConflictBatchStatus::TransactionLockReject;
-				continue;
-			}
 		}
 
 		bool checkSample = trs[self->transactionNum].commitCostEstimation.present();
